@@ -1,0 +1,38 @@
+# Dokploy: create a "Docker Compose" service pointing at this repo, set the variables
+# below in the Environment tab, then add a domain (service: web-mcp, port: 8787, HTTPS).
+# Claude Desktop / claude.ai: add a custom connector for https://<your-domain>/mcp and
+# sign in with WEB_MCP_AUTH_TOKEN. Claude Code: send it as `Authorization: Bearer <token>`.
+services:
+  web-mcp:
+    build: .
+    image: web-mcp:latest
+    restart: unless-stopped
+    environment:
+      # Required: the access token / OAuth login password. `openssl rand -hex 32`
+      WEB_MCP_AUTH_TOKEN: ${WEB_MCP_AUTH_TOKEN:?set WEB_MCP_AUTH_TOKEN}
+      # Required: public HTTPS base URL (enables OAuth; its host is auto-allowed).
+      WEB_MCP_PUBLIC_URL: ${WEB_MCP_PUBLIC_URL:?set WEB_MCP_PUBLIC_URL, e.g. https://mcp.example.com}
+      # Optional: extra accepted Host headers, comma-separated.
+      WEB_MCP_ALLOWED_HOSTS: ${WEB_MCP_ALLOWED_HOSTS:-localhost,127.0.0.1}
+      # Outbound proxy for all web traffic (socks5h:// resolves DNS on the proxy).
+      SOCKS_PROXY: ${SOCKS_PROXY:-}
+      WEB_MCP_TIMEOUT_SECS: ${WEB_MCP_TIMEOUT_SECS:-30}
+      WEB_MCP_RETRIES: ${WEB_MCP_RETRIES:-2}
+      WEB_MCP_MAX_CHARS: ${WEB_MCP_MAX_CHARS:-40000}
+      WEB_MCP_IMPERSONATE: ${WEB_MCP_IMPERSONATE:-chrome}
+      WEB_MCP_SEARCH_ENGINES: ${WEB_MCP_SEARCH_ENGINES:-duckduckgo-lite,bing,duckduckgo-html}
+      RUST_LOG: ${RUST_LOG:-info}
+    # Reached through Dokploy's Traefik; not published on the host.
+    expose:
+      - "8787"
+    networks:
+      - dokploy-network
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  dokploy-network:
+    external: true
