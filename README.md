@@ -79,7 +79,7 @@ Every setting can be given as a CLI flag, an environment variable, or a line in 
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SOCKS_PROXY` | none (direct) | `socks5h://`, `socks5://`, `socks4(a)://`, `http(s)://`. If the proxy is down, requests fail. They never fall back to a direct connection. |
+| `SOCKS_PROXY` | none (direct) | `socks5h://user:pass@host:port`, or the provider format `socks5h://host:port:user:pass`. Also `socks5://`, `socks4(a)://`, `http(s)://`. If the proxy is down, requests fail. They never fall back to a direct connection. |
 | `WEB_MCP_AUTH_TOKEN` | none | Bearer token for `/mcp` and the OAuth sign-in password. |
 | `WEB_MCP_PUBLIC_URL` | none | Public HTTPS base URL. Enables OAuth. |
 | `WEB_MCP_ALLOWED_HOSTS` | `localhost,127.0.0.1,::1` | Extra accepted `Host` headers. |

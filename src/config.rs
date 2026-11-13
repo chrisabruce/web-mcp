@@ -13,7 +13,7 @@
 //! 1. The path in `WEB_MCP_ENV_FILE`, if set.
 //! 2. `./.env` in the current working directory (handy for `cargo run`).
 
-use std::{fmt, net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{ffi::OsStr, fmt, marker::PhantomData, net::SocketAddr, path::PathBuf, str::FromStr};
 
 use url::Url;
 
@@ -35,7 +35,15 @@ pub struct Config {
     /// Outbound proxy for all web traffic, e.g. `socks5h://user:pass@127.0.0.1:1080`.
     ///
     /// When unset, requests go out directly.
-    #[arg(long, env = "SOCKS_PROXY", global = true)]
+    ///
+    /// The provider format `socks5h://host:port:user:pass` is also accepted.
+    #[arg(
+        long,
+        env = "SOCKS_PROXY",
+        hide_env_values = true,
+        value_parser = SecretParser::<ProxyUrl>::new(),
+        global = true
+    )]
     pub proxy: Option<ProxyUrl>,
 
     /// Address the Streamable HTTP MCP endpoint listens on (served at `/mcp`).
@@ -96,6 +104,7 @@ pub struct Config {
         long,
         env = "WEB_MCP_AUTH_TOKEN",
         hide_env_values = true,
+        value_parser = SecretParser::<Secret>::new(),
         global = true
     )]
     pub auth_token: Option<Secret>,
@@ -249,7 +258,11 @@ impl FromStr for ProxyUrl {
     type Err = ProxyUrlError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let url = Url::parse(s.trim())?;
+        let s = s.trim();
+        let url = match from_provider_format(s) {
+            Some(url) => url,
+            None => Url::parse(s)?,
+        };
         if !PROXY_SCHEMES.contains(&url.scheme()) {
             return Err(ProxyUrlError::Scheme(url.scheme().to_owned()));
         }
@@ -257,6 +270,77 @@ impl FromStr for ProxyUrl {
             return Err(ProxyUrlError::MissingHost);
         }
         Ok(Self(url))
+    }
+}
+
+/// Converts the `scheme://host:port:user:pass` format used by many proxy providers into a
+/// standard `scheme://user:pass@host:port` URL. Returns `None` if `s` is not in that format.
+fn from_provider_format(s: &str) -> Option<Url> {
+    let (scheme, rest) = s.split_once("://")?;
+    if rest.contains('@') {
+        return None;
+    }
+    let mut parts = rest.splitn(4, ':');
+    let (host, port, user, pass) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut url = Url::parse(&format!("{scheme}://{host}:{port}")).ok()?;
+    url.set_username(user).ok()?;
+    url.set_password(Some(pass)).ok()?;
+    Some(url)
+}
+
+/// A clap value parser for settings that contain credentials.
+///
+/// clap's default errors quote the rejected value (`invalid value '<value>' for …`), which
+/// would write passwords into container logs. This parser reports the setting and the reason
+/// only.
+#[derive(Debug)]
+struct SecretParser<T>(PhantomData<fn() -> T>);
+
+impl<T> SecretParser<T> {
+    const fn new() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T> Clone for SecretParser<T> {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+impl<T> clap::builder::TypedValueParser for SecretParser<T>
+where
+    T: FromStr + Clone + Send + Sync + 'static,
+    T::Err: fmt::Display,
+{
+    type Value = T;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &OsStr,
+    ) -> Result<T, clap::Error> {
+        let setting = arg.map_or_else(String::new, |arg| {
+            let flag = arg.get_long().map(|l| format!("--{l}")).unwrap_or_default();
+            match arg.get_env() {
+                Some(env) => format!("{} / {flag}", env.to_string_lossy()),
+                None => flag,
+            }
+        });
+        value
+            .to_str()
+            .ok_or_else(|| "not valid UTF-8".to_owned())
+            .and_then(|text| text.parse::<T>().map_err(|e| e.to_string()))
+            .map_err(|reason| {
+                clap::Error::raw(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!("invalid {setting} (value hidden): {reason}\n"),
+                )
+            })
     }
 }
 
@@ -321,6 +405,43 @@ mod tests {
         assert!(!secret.matches("a"));
         assert!(!format!("{secret:?}").contains(&token));
         assert!("short".parse::<Secret>().is_err());
+    }
+
+    #[test]
+    fn accepts_provider_format() {
+        let proxy: ProxyUrl = "socks5h://gate.example.com:10010:user1:p=ss:word"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            proxy.as_str(),
+            "socks5h://user1:p%3Dss%3Aword@gate.example.com:10010"
+        );
+        assert_eq!(
+            proxy.to_string(),
+            "socks5h://user1:***@gate.example.com:10010"
+        );
+    }
+
+    #[test]
+    fn errors_never_echo_secrets() {
+        use clap::Parser;
+        #[derive(Debug, Parser)]
+        struct Cli {
+            #[command(flatten)]
+            config: Config,
+        }
+        for args in [
+            [
+                "test",
+                "--proxy",
+                "socks5h://host:notaport:user:hunter2hunter2",
+            ],
+            ["test", "--auth-token", "hunter2hunter2"],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err().to_string();
+            assert!(!err.contains("hunter2"), "{err}");
+            assert!(err.contains("value hidden"), "{err}");
+        }
     }
 
     #[test]
