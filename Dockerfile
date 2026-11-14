@@ -1,7 +1,10 @@
-# syntax=docker/dockerfile:1
+# Base images are pulled via Google's public Docker Hub mirror, which is unaffected by
+# Docker Hub outages and anonymous pull limits. Use `--build-arg REGISTRY=docker.io/library`
+# to pull from Docker Hub directly.
+ARG REGISTRY=mirror.gcr.io/library
 
 # ---- build -----------------------------------------------------------------
-FROM rust:1.99-bookworm AS build
+FROM ${REGISTRY}/rust:1.99-bookworm AS build
 # BoringSSL (used by wreq for browser TLS impersonation) needs cmake + clang to build.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends cmake clang libclang-dev git \
@@ -15,7 +18,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cp target/release/web-mcp /usr/local/bin/web-mcp
 
 # ---- runtime ---------------------------------------------------------------
-FROM debian:bookworm-slim
+FROM ${REGISTRY}/debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
