@@ -102,12 +102,17 @@ impl FromRequestParts<Arc<AdminState>> for UiUser {
     }
 }
 
-/// Whether a state-changing request comes from this site: `Sec-Fetch-Site` (modern browsers)
-/// must not be cross-site, and `Origin`, if sent, must match `Host`.
+/// Whether a state-changing request comes from this site.
+///
+/// Modern browsers send `Sec-Fetch-Site`, which pages cannot forge: it alone decides
+/// (`same-origin`, or `none` for user-initiated navigation). Only when it is absent (older
+/// browsers, non-browser clients) is `Origin` compared with `Host`; a missing `Origin` is
+/// allowed, but an opaque `Origin: null` is not. `SameSite=Strict` on the session cookie is a
+/// second, independent defence.
 fn same_origin(headers: &HeaderMap) -> bool {
     let get = |name| headers.get(name).and_then(|v| v.to_str().ok());
-    if get("sec-fetch-site").is_some_and(|site| !matches!(site, "same-origin" | "none")) {
-        return false;
+    if let Some(site) = get("sec-fetch-site") {
+        return matches!(site, "same-origin" | "none");
     }
     match (get("origin"), get("host")) {
         (Some(origin), Some(host)) => url::Url::parse(origin)
@@ -583,6 +588,21 @@ mod tests {
         assert!(!same_origin(&headers(&[
             ("host", "mcp.example.com"),
             ("sec-fetch-site", "cross-site")
+        ])));
+        assert!(!same_origin(&headers(&[
+            ("host", "mcp.example.com"),
+            ("sec-fetch-site", "same-site")
+        ])));
+        // What a real browser sends for a form POST from a no-referrer page.
+        assert!(same_origin(&headers(&[
+            ("host", "mcp.example.com"),
+            ("origin", "null"),
+            ("sec-fetch-site", "same-origin")
+        ])));
+        // Without Sec-Fetch-Site, an opaque origin is refused.
+        assert!(!same_origin(&headers(&[
+            ("host", "mcp.example.com"),
+            ("origin", "null")
         ])));
     }
 

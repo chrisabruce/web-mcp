@@ -444,7 +444,9 @@ mod tests {
         fn ui_post(path: &str, body: String, cookie: &str) -> Request<Body> {
             Request::post(path)
                 .header("host", "mcp.example.com")
-                .header("origin", "https://mcp.example.com")
+                // Exactly what browsers send for a form POST from a same-origin page.
+                .header("origin", "null")
+                .header("sec-fetch-site", "same-origin")
                 .header("cookie", cookie)
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(Body::from(body))
@@ -501,7 +503,7 @@ mod tests {
             let mut forged = ui_post("/admin/users", "name=mallory".into(), &admin);
             forged
                 .headers_mut()
-                .insert("origin", "https://evil.example".parse().unwrap());
+                .insert("sec-fetch-site", "cross-site".parse().unwrap());
             assert_eq!(send(&app, forged).await.0, StatusCode::FORBIDDEN);
 
             // Alice's key works on /mcp and in the UI, without the admin section.
