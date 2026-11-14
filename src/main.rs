@@ -12,6 +12,7 @@
 //!
 //! | Module | Responsibility |
 //! |---|---|
+//! | [`block`] | Heuristic detection of anti-bot challenges, CAPTCHAs, and WAF denials. |
 //! | [`config`] | Flags/env/`.env` settings, proxy URL and token validation. |
 //! | [`http`] | Streamable HTTP server: `/mcp` (auth, `Host` allowlist) and `/health`. |
 //! | [`mcp`] | MCP tool definitions (`web_search`, `fetch_url`) and stdio transport. |
@@ -24,6 +25,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod block;
 mod config;
 mod http;
 mod mcp;

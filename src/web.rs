@@ -8,6 +8,10 @@
 //! * [`WebClient::fetch_page`] — download a URL and convert it to Markdown, text, or HTML.
 //! * [`WebClient::search`] — query the configured [`SearchEngine`]s, falling back in order.
 //!
+//! Every response is first checked by [`block::detect`]; anti-bot challenge pages become
+//! [`WebError::Blocked`] instead of being passed off as content. [`WebError::log`] is the single
+//! place failures are logged, at a level matching their cause.
+//!
 //! HTML parsing and conversion are CPU-bound, so they run on Tokio's blocking pool via
 //! [`tokio::task::spawn_blocking`] to keep the async workers responsive.
 
@@ -16,16 +20,32 @@ use std::sync::Arc;
 use scrapling::{selector::Selector, shell::Convertor};
 use scrapling_fetch::{FetchError, Fetcher, Impersonate, Proxy, Response};
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::{
+    block::{self, Block},
     config::Config,
     search::{SearchEngine, SearchHit},
 };
 
 /// Elements tried, in order, to locate a page's main content when no selector is given.
-const MAIN_CONTENT_SELECTORS: &[&str] = &["main", "article", "[role=main]", "body"];
+const MAIN_CONTENT_SELECTORS: &[&str] = &["main", "article", "[role=main]"];
+
+/// A main-content candidate must hold at least this fraction (in percent) of the body's
+/// visible text. Pages that fill `<main>` with JavaScript (e.g. Craigslist search) ship it
+/// empty and keep the server-rendered content elsewhere, so an empty `<main>` must lose to
+/// `<body>`.
+const MAIN_CONTENT_MIN_SHARE_PERCENT: usize = 25;
+
+/// Tags whose text is not visible content.
+const INVISIBLE_TAGS: &[&str] = &["script", "style", "noscript", "template", "svg"];
+
+/// A successful page with less readable text than this is flagged as possibly JS-rendered…
+const THIN_CONTENT_CHARS: usize = 200;
+/// …but only if its HTML is at least this large: a big document with almost no text is an
+/// app shell, while a small one (e.g. `example.com`) is just a short page.
+const APP_SHELL_MIN_BYTES: usize = 5 * 1024;
 
 /// Output representation for fetched pages.
 #[derive(
@@ -72,6 +92,8 @@ pub struct Page {
     pub total_chars: usize,
     /// Offset to pass as `start` to read the next slice, if content was truncated.
     pub next_start: Option<usize>,
+    /// A caveat for the model about the content, e.g. that the page needs JavaScript.
+    pub notice: Option<&'static str>,
 }
 
 impl std::fmt::Display for Page {
@@ -81,6 +103,9 @@ impl std::fmt::Display for Page {
         writeln!(f, "Status: {}", self.status)?;
         if let Some(title) = &self.title {
             writeln!(f, "Title: {title}")?;
+        }
+        if let Some(notice) = self.notice {
+            writeln!(f, "Note: {notice}")?;
         }
         if let Some(next) = self.next_start {
             writeln!(
@@ -116,6 +141,17 @@ pub enum WebError {
     /// A user-supplied CSS selector matched no elements.
     #[error("CSS selector `{0}` matched nothing on the page")]
     SelectorMatchedNothing(String),
+    /// The site answered with an anti-bot challenge, CAPTCHA, or denial instead of content.
+    #[error(
+        "{url} blocked the request: {block}. The site's anti-bot protection rejected this \
+         server; retrying will not help, so try another source for this information."
+    )]
+    Blocked {
+        /// The URL that was requested.
+        url: String,
+        /// What blocked it.
+        block: Block,
+    },
     /// Every configured search engine failed or returned no results.
     #[error("no search results for `{query}` (tried: {tried})")]
     NoResults {
@@ -127,6 +163,39 @@ pub enum WebError {
     /// The blocking HTML-conversion task panicked.
     #[error("content extraction task failed: {0}")]
     Extraction(#[from] tokio::task::JoinError),
+}
+
+impl WebError {
+    /// Logs this failure once, at a level that matches its cause.
+    ///
+    /// * `WARN`: the target site blocked us, or the request was refused as an internal address.
+    /// * `ERROR`: network, proxy, TLS, or internal failures, and searches where every engine
+    ///   failed. These need an operator's attention.
+    /// * `INFO`: bad input from the client (invalid URL, selector that matched nothing).
+    ///
+    /// `operation` names what was attempted (e.g. `"fetch_url"`); `target` is the URL or query.
+    pub fn log(&self, operation: &str, target: &str) {
+        match self {
+            Self::Blocked { block, .. } => warn!(
+                operation,
+                target,
+                reason = block.reason,
+                status = block.status,
+                "site blocked request"
+            ),
+            Self::InternalAddress(_) => {
+                warn!(operation, target, error = %self, "refused internal address")
+            }
+            Self::Fetch(_) | Self::NoResults { .. } | Self::Extraction(_) => {
+                error!(operation, target, error = %self, "request failed")
+            }
+            Self::InvalidUrl { .. }
+            | Self::UnsupportedScheme(_)
+            | Self::SelectorMatchedNothing(_) => {
+                info!(operation, target, error = %self, "rejected request")
+            }
+        }
+    }
 }
 
 /// Cheaply cloneable handle for all outbound web traffic.
@@ -164,9 +233,15 @@ impl WebClient {
     /// [`WebError::SelectorMatchedNothing`] if an explicit selector finds no elements.
     pub async fn fetch_page(&self, req: PageRequest) -> Result<Page, WebError> {
         let url = parse_http_url(&req.url)?;
-        let response = self.get(&url).await?;
+        let response = self.get_unblocked(&url).await?;
         let max_chars = req.max_chars.unwrap_or(self.config.max_chars);
-        tokio::task::spawn_blocking(move || extract_page(&response, &req, max_chars)).await?
+        let page =
+            tokio::task::spawn_blocking(move || extract_page(&response, &req, max_chars)).await??;
+        info!(url = %page.url, status = page.status, chars = page.total_chars, "fetched page");
+        if let Some(notice) = page.notice {
+            warn!(url = %page.url, status = page.status, chars = page.total_chars, notice, "thin page content");
+        }
+        Ok(page)
     }
 
     /// Searches the web, trying each configured engine in order until one returns hits.
@@ -184,9 +259,16 @@ impl WebClient {
                     info!(%engine, count = hits.len(), "search succeeded");
                     return Ok(hits.into_iter().take(limit).collect());
                 }
-                Ok(_) => attempts.push(format!("{engine}: no results")),
+                Ok(_) => {
+                    warn!(%engine, query, "search engine returned no results");
+                    attempts.push(format!("{engine}: no results"));
+                }
+                Err(WebError::Blocked { block, .. }) => {
+                    warn!(%engine, query, reason = block.reason, status = block.status, "search engine blocked request");
+                    attempts.push(format!("{engine}: blocked ({block})"));
+                }
                 Err(err) => {
-                    warn!(%engine, error = %err, "search engine failed");
+                    warn!(%engine, query, error = %err, "search engine failed");
                     attempts.push(format!("{engine}: {err}"));
                 }
             }
@@ -202,14 +284,22 @@ impl WebClient {
         engine: SearchEngine,
         query: &str,
     ) -> Result<Vec<SearchHit>, WebError> {
-        let response = self.get(&engine.results_url(query)).await?;
+        let response = self.get_unblocked(&engine.results_url(query)).await?;
         let html = String::from_utf8_lossy(&response.body).into_owned();
         Ok(tokio::task::spawn_blocking(move || engine.parse(&html)).await?)
     }
 
-    async fn get(&self, url: &Url) -> Result<Response, FetchError> {
+    /// GETs `url`, turning anti-bot responses into [`WebError::Blocked`].
+    async fn get_unblocked(&self, url: &Url) -> Result<Response, WebError> {
         debug!(%url, "GET");
-        self.fetcher.get(url.as_str(), None).await
+        let response = self.fetcher.get(url.as_str(), None).await?;
+        match block::detect(response.status, &response.headers, &response.body) {
+            Some(block) => Err(WebError::Blocked {
+                url: url.to_string(),
+                block,
+            }),
+            None => Ok(response),
+        }
     }
 }
 
@@ -288,9 +378,7 @@ fn extract_page(
     let html = match &req.selector {
         Some(selector) => outer_html(doc, selector)
             .ok_or_else(|| WebError::SelectorMatchedNothing(selector.clone()))?,
-        None => MAIN_CONTENT_SELECTORS
-            .iter()
-            .find_map(|selector| outer_html(doc, selector))
+        None => main_content_html(doc)
             .unwrap_or_else(|| String::from_utf8_lossy(&response.body).into_owned()),
     };
 
@@ -300,6 +388,14 @@ fn extract_page(
         Format::Html => html,
     };
     let (content, total_chars, next_start) = window(converted.trim(), req.start, max_chars);
+    let thin = req.selector.is_none()
+        && (200..300).contains(&response.status)
+        && total_chars < THIN_CONTENT_CHARS
+        && response.body.len() >= APP_SHELL_MIN_BYTES;
+    let notice = thin.then_some(
+        "the page has very little readable content. It is probably rendered by JavaScript, \
+         which this fetcher does not run; look for an API, RSS feed, or another source.",
+    );
 
     Ok(Page {
         url: response.url().to_owned(),
@@ -312,7 +408,29 @@ fn extract_page(
         content,
         total_chars,
         next_start,
+        notice,
     })
+}
+
+/// The HTML of the page's main content: the first of [`MAIN_CONTENT_SELECTORS`] holding a
+/// meaningful share of the visible text, else `<body>`. `None` if there is no body either.
+fn main_content_html(doc: &Selector) -> Option<String> {
+    let body_chars = doc.css("body").iter().map(visible_chars).sum::<usize>();
+    let min_chars = (body_chars * MAIN_CONTENT_MIN_SHARE_PERCENT / 100).max(1);
+    MAIN_CONTENT_SELECTORS
+        .iter()
+        .find(|selector| doc.css(selector).iter().map(visible_chars).sum::<usize>() >= min_chars)
+        .and_then(|selector| outer_html(doc, selector))
+        .or_else(|| outer_html(doc, "body"))
+}
+
+/// Number of visible (non-script/style) text characters inside `element`.
+fn visible_chars(element: &Selector) -> usize {
+    element
+        .get_all_text(" ", true, INVISIBLE_TAGS, true)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .count()
 }
 
 /// Concatenated outer HTML of every element matching `selector`, or `None` if nothing
@@ -384,6 +502,28 @@ mod tests {
     }
 
     #[test]
+    fn main_content_skips_empty_js_shell() {
+        // Craigslist-style: `<main>` is filled by JavaScript, results are elsewhere.
+        let html = r#"<html><body><main>
+            </main><ol class="results"><li>Fuji hybrid bike $175</li><li>Kona road bike $400</li></ol>
+            <script>var big = "lots of script text that should not count as content";</script></body></html>"#;
+        let doc = Selector::from_html(html);
+        let chosen = main_content_html(&doc).unwrap();
+        assert!(chosen.contains("Fuji hybrid bike"), "{chosen}");
+    }
+
+    #[test]
+    fn main_content_prefers_article_when_it_holds_the_text() {
+        let html = format!(
+            "<html><body><nav>Home About</nav><article>{}</article><footer>c</footer></body></html>",
+            "The real story. ".repeat(50)
+        );
+        let doc = Selector::from_html(&html);
+        let chosen = main_content_html(&doc).unwrap();
+        assert!(chosen.starts_with("<article"), "{chosen}");
+    }
+
+    #[test]
     fn window_pages_through_text_on_char_boundaries() {
         let text = "héllo wörld";
         assert_eq!(window(text, 0, 5), ("héllo".into(), 11, Some(5)));
@@ -400,6 +540,7 @@ mod tests {
             content: "body".into(),
             total_chars: 10,
             next_start: Some(4),
+            notice: None,
         };
         let shown = page.to_string();
         assert!(shown.contains("Title: T"));

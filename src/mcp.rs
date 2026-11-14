@@ -18,7 +18,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use crate::web::{Format, PageRequest, WebClient};
+use crate::web::{Format, PageRequest, WebClient, WebError};
 
 /// Hard ceiling on `web_search` results, regardless of what the model asks for.
 const MAX_SEARCH_RESULTS: usize = 25;
@@ -83,7 +83,7 @@ impl WebMcp {
             .web
             .search(&args.query, limit)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| report(&e, "web_search", &args.query))?;
         Ok(hits
             .iter()
             .enumerate()
@@ -105,6 +105,7 @@ impl WebMcp {
         description = "Fetch a web page (through the user's proxy, with browser impersonation) and return its main content as markdown (default), plain text or HTML. Long pages are truncated; the response says which `start` offset to request next."
     )]
     async fn fetch_url(&self, Parameters(args): Parameters<FetchArgs>) -> Result<String, String> {
+        let url = args.url.clone();
         let request = PageRequest {
             url: args.url,
             format: args.format,
@@ -116,8 +117,14 @@ impl WebMcp {
             .fetch_page(request)
             .await
             .map(|page| page.to_string())
-            .map_err(|e| e.to_string())
+            .map_err(|e| report(&e, "fetch_url", &url))
     }
+}
+
+/// Logs a failed tool call and converts it into the error text returned to the model.
+fn report(error: &WebError, tool: &str, target: &str) -> String {
+    error.log(tool, target);
+    error.to_string()
 }
 
 #[tool_handler(
