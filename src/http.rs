@@ -4,7 +4,9 @@
 //!
 //! | Path | Auth | Purpose |
 //! |---|---|---|
-//! | `/mcp` | `Authorization: Bearer <token>` when a token is configured | MCP Streamable HTTP endpoint serving [`WebMcp`]. |
+//! | `/mcp` | bearer: master token, user key, or OAuth access token | MCP Streamable HTTP endpoint serving [`WebMcp`]. |
+//! | `/admin/…` | UI session cookie | User keys and site logins ([`crate::admin`]). |
+//! | `/.well-known/…`, `/register`, `/authorize`, `/token` | none | OAuth, when `WEB_MCP_PUBLIC_URL` is set ([`crate::oauth`]). |
 //! | `/health` | none | Liveness probe for container health checks; returns `ok`. |
 //!
 //! `/mcp` is additionally protected by rmcp's `Host` header allowlist
@@ -13,14 +15,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    Router,
-    extract::{Request, State},
-    http::{StatusCode, header},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::get,
-};
+use axum::{Router, middleware, routing::get};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -29,25 +24,47 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::{
+    admin::{self, AdminState},
+    auth::{Authenticator, McpAuth, require_auth},
     config::{Config, Secret},
     mcp::WebMcp,
     oauth::OAuth,
+    sites::Sites,
+    store::Store,
     web::WebClient,
 };
+
+/// Everything the server needs, built once at startup and shared by all routes.
+#[derive(Clone)]
+pub struct Services {
+    /// Settings.
+    pub config: Arc<Config>,
+    /// Credential resolution (master token, user keys, OAuth tokens).
+    pub auth: Authenticator,
+    /// Logged-in and anonymous browsing.
+    pub sites: Sites,
+}
+
+impl Services {
+    /// Wires the services together. `master` is the validated `WEB_MCP_AUTH_TOKEN`.
+    pub fn new(config: Config, master: Secret, web: WebClient, store: Store) -> Self {
+        Self {
+            auth: Authenticator::new(master, store.clone()),
+            sites: Sites::new(web, store),
+            config: Arc::new(config),
+        }
+    }
+}
 
 /// Binds [`Config::bind`] and serves until `shutdown` is cancelled.
 ///
 /// # Errors
 ///
 /// Fails if the address cannot be bound or the server hits a fatal I/O error.
-pub async fn serve(
-    config: &Config,
-    web: WebClient,
-    shutdown: CancellationToken,
-) -> std::io::Result<()> {
-    let listener = TcpListener::bind(config.bind).await?;
-    info!(addr = %listener.local_addr()?, "MCP endpoint listening on /mcp");
-    let app = router(config, web, shutdown.child_token());
+pub async fn serve(services: Services, shutdown: CancellationToken) -> std::io::Result<()> {
+    let listener = TcpListener::bind(services.config.bind).await?;
+    info!(addr = %listener.local_addr()?, "MCP endpoint on /mcp, admin UI on /admin");
+    let app = router(&services, shutdown.child_token());
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown.cancelled_owned())
         .await?;
@@ -56,34 +73,43 @@ pub async fn serve(
 }
 
 /// Builds the application router. Cancelling `cancel` closes all MCP sessions.
-fn router(config: &Config, web: WebClient, cancel: CancellationToken) -> Router {
+fn router(services: &Services, cancel: CancellationToken) -> Router {
+    let config = &services.config;
+    let sites = services.sites.clone();
     let mcp = StreamableHttpService::new(
-        move || Ok(WebMcp::new(web.clone())),
+        move || Ok(WebMcp::new(sites.clone())),
         Arc::new(LocalSessionManager::default()),
         mcp_transport_config(config, cancel),
     );
 
-    let oauth = match (&config.public_url, &config.auth_token) {
-        (Some(public_url), Some(token)) => {
-            info!(%public_url, "OAuth enabled for Claude Desktop / claude.ai connectors");
-            Some(Arc::new(OAuth::new(public_url, token)))
-        }
-        _ => None,
-    };
-    let auth = Arc::new(Auth {
-        token: config.auth_token.clone(),
-        oauth: oauth.clone(),
+    let oauth = config.public_url.as_ref().map(|public_url| {
+        info!(%public_url, "OAuth enabled for Claude Desktop / claude.ai connectors");
+        Arc::new(OAuth::new(public_url, services.auth.clone()))
+    });
+    let mcp_auth = Arc::new(McpAuth {
+        auth: services.auth.clone(),
+        resource_metadata: oauth.as_ref().map(|o| o.resource_metadata_url()),
+    });
+    let admin = Arc::new(AdminState {
+        auth: services.auth.clone(),
+        sites: services.sites.clone(),
+        secure_cookies: config
+            .public_url
+            .as_ref()
+            .is_some_and(|u| u.scheme() == "https"),
+        mcp_url: config.public_mcp_url(),
     });
 
-    let mut router = Router::new().nest_service("/mcp", mcp);
-    if auth.token.is_some() {
-        router = router.layer(middleware::from_fn_with_state(auth, require_auth));
-    }
-    // Merged after the auth layer: discovery, login, and health need no token.
+    let mut router = Router::new()
+        .nest_service("/mcp", mcp)
+        .layer(middleware::from_fn_with_state(mcp_auth, require_auth));
+    // Merged after the auth layer: OAuth, the UI (own cookie auth), and health need no bearer.
     if let Some(oauth) = oauth {
         router = router.merge(oauth.routes());
     }
-    router.route("/health", get(|| async { "ok" }))
+    router
+        .merge(admin::routes(admin))
+        .route("/health", get(|| async { "ok" }))
 }
 
 /// rmcp transport settings: `Host` allowlist (`*` disables it) and shutdown token.
@@ -95,53 +121,6 @@ fn mcp_transport_config(config: &Config, cancel: CancellationToken) -> Streamabl
     } else {
         base.with_allowed_hosts(hosts)
     }
-}
-
-/// Credentials accepted on `/mcp`.
-struct Auth {
-    /// Static bearer token (Claude Code and other header-capable clients).
-    token: Option<Secret>,
-    /// OAuth access tokens (Claude Desktop / claude.ai connectors), when enabled.
-    oauth: Option<Arc<OAuth>>,
-}
-
-impl Auth {
-    fn accepts(&self, bearer: &str) -> bool {
-        self.token.as_ref().is_some_and(|t| t.matches(bearer))
-            || self
-                .oauth
-                .as_ref()
-                .is_some_and(|o| o.verify_access_token(bearer))
-    }
-}
-
-/// Middleware rejecting requests without a valid `Authorization: Bearer` credential.
-///
-/// With OAuth enabled the 401 advertises the resource metadata URL, which is how MCP clients
-/// discover where to sign in.
-async fn require_auth(State(auth): State<Arc<Auth>>, request: Request, next: Next) -> Response {
-    let authorized = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|bearer| auth.accepts(bearer.trim()));
-    if authorized {
-        return next.run(request).await;
-    }
-    let challenge = match &auth.oauth {
-        Some(oauth) => format!(
-            r#"Bearer resource_metadata="{}""#,
-            oauth.resource_metadata_url()
-        ),
-        None => "Bearer".to_owned(),
-    };
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, challenge)],
-        "unauthorized\n",
-    )
-        .into_response()
 }
 
 #[cfg(test)]
@@ -158,14 +137,21 @@ mod tests {
         config: Config,
     }
 
+    /// Services over an in-memory store, with extra CLI `args`.
+    fn services(args: &[&str]) -> Services {
+        let argv = ["test", "--auth-token", TOKEN].iter().chain(args).copied();
+        let config = TestCli::parse_from(argv).config;
+        let master: Secret = TOKEN.parse().unwrap();
+        let web = WebClient::new(&config).unwrap();
+        Services::new(config, master.clone(), web, Store::in_memory(&master))
+    }
+
     /// Starts the router on an ephemeral port and returns its address.
     async fn spawn_app() -> (std::net::SocketAddr, CancellationToken) {
-        let config = TestCli::parse_from(["test", "--auth-token", TOKEN]).config;
-        let web = WebClient::new(&config).unwrap();
         let cancel = CancellationToken::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router(&config, web, cancel.child_token());
+        let app = router(&services(&[]), cancel.child_token());
         let shutdown = cancel.clone();
         tokio::spawn(async move {
             axum::serve(listener, app)
@@ -234,10 +220,10 @@ mod tests {
         const VERIFIER: &str = "a-sufficiently-long-pkce-code-verifier-0123456789";
 
         fn app() -> Router {
-            let config =
-                TestCli::parse_from(["test", "--auth-token", TOKEN, "--public-url", PUBLIC]).config;
-            let web = WebClient::new(&config).unwrap();
-            router(&config, web, CancellationToken::new())
+            router(
+                &services(&["--public-url", PUBLIC]),
+                CancellationToken::new(),
+            )
         }
 
         async fn send(
@@ -450,6 +436,208 @@ mod tests {
                 .unwrap();
             let (status, _, _) = send(&app, insecure).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        // ---- admin UI and user keys -------------------------------------------------------
+
+        /// A same-origin form POST carrying the UI session `cookie`.
+        fn ui_post(path: &str, body: String, cookie: &str) -> Request<Body> {
+            Request::post(path)
+                .header("host", "mcp.example.com")
+                .header("origin", "https://mcp.example.com")
+                .header("cookie", cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        fn ui_get(path: &str, cookie: &str) -> Request<Body> {
+            Request::get(path)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap()
+        }
+
+        /// Signs in to the UI with `key`; returns the `name=value` session cookie.
+        async fn ui_sign_in(app: &Router, key: &str) -> String {
+            let (status, headers, _) = send(
+                app,
+                ui_post("/admin/login", format!("key={}", enc(key)), ""),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SEE_OTHER);
+            let set = headers["set-cookie"].to_str().unwrap();
+            assert!(
+                set.contains("HttpOnly")
+                    && set.contains("SameSite=Strict")
+                    && set.contains("Secure")
+            );
+            set.split(';').next().unwrap().to_owned()
+        }
+
+        #[tokio::test]
+        async fn admin_creates_keys_users_stay_private_and_revocation_is_immediate() {
+            let services = services(&["--public-url", PUBLIC]);
+            let app = router(&services, CancellationToken::new());
+
+            // Unauthenticated UI access redirects to sign-in; a bad key is rejected.
+            let (status, headers, _) = send(&app, ui_get("/admin", "")).await;
+            assert_eq!(
+                (status, headers["location"].to_str().unwrap()),
+                (StatusCode::SEE_OTHER, "/admin/login")
+            );
+            let (status, _, _) = send(&app, ui_post("/admin/login", "key=wrong".into(), "")).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+            // The admin creates a key for alice; it is shown once.
+            let admin = ui_sign_in(&app, TOKEN).await;
+            let (status, _, page) =
+                send(&app, ui_post("/admin/users", "name=alice".into(), &admin)).await;
+            assert_eq!(status, StatusCode::OK);
+            let start = page.find("wmk_").expect("new key shown");
+            let alice_key = page[start..start + 68].to_owned();
+
+            // Cross-origin form posts are refused even with a valid session.
+            let mut forged = ui_post("/admin/users", "name=mallory".into(), &admin);
+            forged
+                .headers_mut()
+                .insert("origin", "https://evil.example".parse().unwrap());
+            assert_eq!(send(&app, forged).await.0, StatusCode::FORBIDDEN);
+
+            // Alice's key works on /mcp and in the UI, without the admin section.
+            assert_eq!(send(&app, mcp_ping(&alice_key)).await.0, StatusCode::OK);
+            let alice = ui_sign_in(&app, &alice_key).await;
+            let (_, _, alice_page) = send(&app, ui_get("/admin", &alice)).await;
+            assert!(alice_page.contains("Signed in as <strong>alice</strong>"));
+            assert!(!alice_page.contains("User keys"));
+            assert_eq!(
+                send(&app, ui_post("/admin/users", "name=x".into(), &alice))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+
+            // Alice imports cookies; they are hers alone.
+            let body = format!(
+                "domain={}&cookies={}",
+                enc("https://www.craigslist.org/"),
+                enc("cl_session=abc; theme=dark")
+            );
+            let (status, headers, _) =
+                send(&app, ui_post("/admin/sites/cookies", body, &alice)).await;
+            assert_eq!(
+                (status, headers["location"].to_str().unwrap()),
+                (StatusCode::SEE_OTHER, "/admin?m=cookies-imported")
+            );
+            let store = services.auth.store();
+            let alice_id = services.auth.by_key(&alice_key).await.unwrap().id;
+            let record = store
+                .site_for_host(alice_id, "sfbay.craigslist.org")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.jar.unwrap().len(), 2);
+            assert!(
+                store
+                    .site_for_host(store.admin_id(), "craigslist.org")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let (_, _, alice_page) = send(&app, ui_get("/admin", &alice)).await;
+            assert!(
+                alice_page.contains("craigslist.org") && alice_page.contains("2 cookies (import)")
+            );
+            assert!(
+                !alice_page.contains("abc"),
+                "cookie values must never be rendered"
+            );
+
+            // Alice signs in to Claude Desktop with her key (OAuth) and gets her own token.
+            let access = oauth_access_token(&app, &alice_key).await;
+            assert_eq!(send(&app, mcp_ping(&access.0)).await.0, StatusCode::OK);
+
+            // Revoking alice cuts off her key, her OAuth tokens, and her UI session.
+            let (status, _, _) = send(
+                &app,
+                ui_post(
+                    &format!("/admin/users/{alice_id}/revoke"),
+                    String::new(),
+                    &admin,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SEE_OTHER);
+            assert_eq!(
+                send(&app, mcp_ping(&alice_key)).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                send(&app, mcp_ping(&access.0)).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+            let refresh = form(
+                "/token",
+                format!("grant_type=refresh_token&refresh_token={}", enc(&access.1)),
+            );
+            let (status, _, body) = send(&app, refresh).await;
+            assert!(
+                status == StatusCode::BAD_REQUEST && body.contains("revoked"),
+                "{body}"
+            );
+            assert_eq!(
+                send(&app, ui_get("/admin", &alice)).await.0,
+                StatusCode::SEE_OTHER
+            );
+            // The admin is unaffected.
+            assert_eq!(send(&app, mcp_ping(TOKEN)).await.0, StatusCode::OK);
+        }
+
+        /// Runs the OAuth flow signing in with `key`; returns (access, refresh) tokens.
+        async fn oauth_access_token(app: &Router, key: &str) -> (String, String) {
+            let reg = Request::post("/register")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"redirect_uris":["{REDIRECT}"]}}"#)))
+                .unwrap();
+            let (_, _, body) = send(app, reg).await;
+            let client: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let client_id = client["client_id"].as_str().unwrap();
+            let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER));
+            let authorize = format!(
+                "/authorize?response_type=code&client_id={}&redirect_uri={}&code_challenge={challenge}&code_challenge_method=S256",
+                enc(client_id),
+                enc(REDIRECT)
+            );
+            let (_, _, page) =
+                send(app, Request::get(&authorize).body(Body::empty()).unwrap()).await;
+            let request = hidden_request(&page);
+            let (_, headers, _) = send(
+                app,
+                form(
+                    "/authorize",
+                    format!("request={}&password={}", enc(&request), enc(key)),
+                ),
+            )
+            .await;
+            let location = url::Url::parse(headers["location"].to_str().unwrap()).unwrap();
+            let code = location
+                .query_pairs()
+                .find(|(k, _)| k == "code")
+                .unwrap()
+                .1
+                .into_owned();
+            let exchange = format!(
+                "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={VERIFIER}",
+                enc(&code),
+                enc(REDIRECT),
+                enc(client_id)
+            );
+            let (_, _, body) = send(app, form("/token", exchange)).await;
+            let tokens: serde_json::Value = serde_json::from_str(&body).unwrap();
+            (
+                tokens["access_token"].as_str().unwrap().into(),
+                tokens["refresh_token"].as_str().unwrap().into(),
+            )
         }
     }
 }

@@ -15,10 +15,12 @@
 //! HTML parsing and conversion are CPU-bound, so they run on Tokio's blocking pool via
 //! [`tokio::task::spawn_blocking`] to keep the async workers responsive.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use scrapling::{selector::Selector, shell::Convertor};
-use scrapling_fetch::{FetchError, Fetcher, Impersonate, Proxy, Response};
+use scrapling_fetch::{
+    FetchError, Fetcher, FollowRedirects, Impersonate, Proxy, RequestConfig, Response,
+};
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -26,8 +28,64 @@ use url::Url;
 use crate::{
     block::{self, Block},
     config::Config,
+    cookies::{CookieJar, domain_matches},
+    images::{self, ImageError, Prepared},
     search::{SearchEngine, SearchHit},
 };
+
+/// Redirects followed per request before giving up.
+const MAX_REDIRECTS: usize = 10;
+
+/// Largest image download accepted.
+const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+
+/// A logged-in session for one site, threaded through requests so `Set-Cookie` updates
+/// (including those on intermediate redirects) are captured.
+#[derive(Debug, Clone)]
+pub struct SiteSession {
+    /// Domain the cookies apply to (and its subdomains).
+    pub domain: String,
+    /// Current cookies.
+    pub jar: CookieJar,
+    /// Whether the jar changed since it was loaded and should be saved.
+    pub changed: bool,
+}
+
+impl SiteSession {
+    /// Wraps a loaded jar for `domain`.
+    pub fn new(domain: impl Into<String>, jar: CookieJar) -> Self {
+        Self {
+            domain: domain.into(),
+            jar,
+            changed: false,
+        }
+    }
+
+    fn covers(&self, url: &Url) -> bool {
+        url.host_str()
+            .is_some_and(|host| domain_matches(&self.domain, host))
+    }
+}
+
+/// A form submission: `application/x-www-form-urlencoded` fields, sent as POST.
+#[derive(Debug, Clone)]
+pub struct FormPost {
+    /// Field names and values, in order.
+    pub fields: Vec<(String, String)>,
+    /// Page the form was on, sent as `Referer` (and its origin as `Origin`).
+    pub referer: Url,
+}
+
+/// An image fetched for the model.
+#[derive(Debug, Clone)]
+pub struct FetchedImage {
+    /// Final URL after redirects.
+    pub url: String,
+    /// Size of the original download.
+    pub source_bytes: usize,
+    /// The prepared image.
+    pub image: Prepared,
+}
 
 /// Elements tried, in order, to locate a page's main content when no selector is given.
 const MAIN_CONTENT_SELECTORS: &[&str] = &["main", "article", "[role=main]"];
@@ -152,6 +210,28 @@ pub enum WebError {
         /// What blocked it.
         block: Block,
     },
+    /// A redirect chain was too long (or looped).
+    #[error("too many redirects fetching {0}")]
+    TooManyRedirects(String),
+    /// The response was not a usable image.
+    #[error("{url}: {source}")]
+    Image {
+        /// The URL requested.
+        url: String,
+        /// What was wrong.
+        source: ImageError,
+    },
+    /// The image URL answered with an error status.
+    #[error("{url} returned HTTP {status} instead of an image")]
+    ImageStatus {
+        /// The final URL.
+        url: String,
+        /// The HTTP status.
+        status: u16,
+    },
+    /// The image is larger than the download limit.
+    #[error("{0} is larger than the 25 MB image limit")]
+    ImageTooLarge(String),
     /// Every configured search engine failed or returned no results.
     #[error("no search results for `{query}` (tried: {tried})")]
     NoResults {
@@ -186,8 +266,14 @@ impl WebError {
             Self::InternalAddress(_) => {
                 warn!(operation, target, error = %self, "refused internal address")
             }
-            Self::Fetch(_) | Self::NoResults { .. } | Self::Extraction(_) => {
+            Self::Fetch(_)
+            | Self::NoResults { .. }
+            | Self::Extraction(_)
+            | Self::TooManyRedirects(_) => {
                 error!(operation, target, error = %self, "request failed")
+            }
+            Self::Image { .. } | Self::ImageStatus { .. } | Self::ImageTooLarge(_) => {
+                warn!(operation, target, error = %self, "unusable image")
             }
             Self::InvalidUrl { .. }
             | Self::UnsupportedScheme(_)
@@ -231,9 +317,15 @@ impl WebClient {
     /// [`WebError::InvalidUrl`]/[`WebError::UnsupportedScheme`] for bad input,
     /// [`WebError::Fetch`] for network/proxy failures, and
     /// [`WebError::SelectorMatchedNothing`] if an explicit selector finds no elements.
-    pub async fn fetch_page(&self, req: PageRequest) -> Result<Page, WebError> {
+    ///
+    /// With a `session`, its cookies are sent to the site and updated from the responses.
+    pub async fn fetch_page(
+        &self,
+        req: PageRequest,
+        session: Option<&mut SiteSession>,
+    ) -> Result<Page, WebError> {
         let url = parse_http_url(&req.url)?;
-        let response = self.get_unblocked(&url).await?;
+        let response = self.request(&url, None, session).await?;
         let max_chars = req.max_chars.unwrap_or(self.config.max_chars);
         let page =
             tokio::task::spawn_blocking(move || extract_page(&response, &req, max_chars)).await??;
@@ -284,22 +376,134 @@ impl WebClient {
         engine: SearchEngine,
         query: &str,
     ) -> Result<Vec<SearchHit>, WebError> {
-        let response = self.get_unblocked(&engine.results_url(query)).await?;
+        let response = self.request(&engine.results_url(query), None, None).await?;
         let html = String::from_utf8_lossy(&response.body).into_owned();
         Ok(tokio::task::spawn_blocking(move || engine.parse(&html)).await?)
     }
 
-    /// GETs `url`, turning anti-bot responses into [`WebError::Blocked`].
-    async fn get_unblocked(&self, url: &Url) -> Result<Response, WebError> {
-        debug!(%url, "GET");
-        let response = self.fetcher.get(url.as_str(), None).await?;
-        match block::detect(response.status, &response.headers, &response.body) {
-            Some(block) => Err(WebError::Blocked {
-                url: url.to_string(),
-                block,
-            }),
-            None => Ok(response),
+    /// Downloads an image and prepares it for the model (see [`images::prepare`]).
+    ///
+    /// # Errors
+    ///
+    /// The [`fetch_page`](Self::fetch_page) errors, plus [`WebError::Image`] when the URL does
+    /// not serve an image and [`WebError::ImageTooLarge`] above the size limit.
+    pub async fn fetch_image(
+        &self,
+        url: &str,
+        session: Option<&mut SiteSession>,
+    ) -> Result<FetchedImage, WebError> {
+        let url = parse_http_url(url)?;
+        let response = self.request(&url, None, session).await?;
+        let final_url = response.url().to_owned();
+        if !(200..300).contains(&response.status) {
+            return Err(WebError::ImageStatus {
+                url: final_url,
+                status: response.status,
+            });
         }
+        if response.body.len() > MAX_IMAGE_BYTES {
+            return Err(WebError::ImageTooLarge(final_url));
+        }
+        let content_type = header(&response.headers, "content-type").map(str::to_owned);
+        let source_bytes = response.body.len();
+        let prepared = tokio::task::spawn_blocking(move || {
+            images::prepare(&response.body, content_type.as_deref())
+        })
+        .await?;
+        let image = prepared.map_err(|source| WebError::Image {
+            url: final_url.clone(),
+            source,
+        })?;
+        info!(url = %final_url, bytes = source_bytes, "fetched image");
+        Ok(FetchedImage {
+            url: final_url,
+            source_bytes,
+            image,
+        })
+    }
+
+    /// Sends a GET (or the `form` POST) to `url`, following redirects manually.
+    ///
+    /// Following redirects here rather than in the HTTP client lets every hop pass the SSRF
+    /// guard, and lets a `session` send and capture cookies on each hop (logins commonly set
+    /// the session cookie on a `302`). 301/302/303 turn a POST into a GET; 307/308 repeat it.
+    /// The final response is checked by [`block::detect`].
+    ///
+    /// # Errors
+    ///
+    /// Network/proxy failures, [`WebError::InternalAddress`] for a redirect into a private
+    /// network, [`WebError::TooManyRedirects`], and [`WebError::Blocked`].
+    pub async fn request(
+        &self,
+        url: &Url,
+        form: Option<&FormPost>,
+        mut session: Option<&mut SiteSession>,
+    ) -> Result<Response, WebError> {
+        match self
+            .request_as(url, form, session.as_deref_mut(), Profile::Browser)
+            .await
+        {
+            Err(WebError::Blocked { block, .. })
+                if block.is_generic_denial() && self.config.impersonate != "none" =>
+            {
+                // Some sites (e.g. Wikimedia's file servers) reject impersonated browsers but
+                // serve plain clients; vendor challenges are never retried.
+                info!(%url, "generic 403 while impersonating a browser; retrying as a plain client");
+                self.request_as(url, form, session, Profile::Plain).await
+            }
+            other => other,
+        }
+    }
+
+    /// One redirect-following request with the given client [`Profile`].
+    async fn request_as(
+        &self,
+        url: &Url,
+        form: Option<&FormPost>,
+        mut session: Option<&mut SiteSession>,
+        profile: Profile,
+    ) -> Result<Response, WebError> {
+        let mut url = url.clone();
+        let mut form = form;
+        for _ in 0..=MAX_REDIRECTS {
+            let session_cookies = session
+                .as_deref()
+                .filter(|s| s.covers(&url) && !s.jar.is_empty())
+                .map(|s| s.jar.to_map());
+            let config = request_config(session_cookies, form, profile);
+            debug!(%url, method = if form.is_some() { "POST" } else { "GET" }, "request");
+            let response = match form {
+                Some(_) => self.fetcher.post(url.as_str(), Some(config)).await?,
+                None => self.fetcher.get(url.as_str(), Some(config)).await?,
+            };
+            if let Some(session) = session.as_deref_mut().filter(|s| s.covers(&url)) {
+                session.changed |= session.jar.merge(&response.cookies);
+            }
+
+            let location = header(&response.headers, "location");
+            match (response.status, location) {
+                (301 | 302 | 303 | 307 | 308, Some(location)) => {
+                    let next = url.join(location).map_err(|source| WebError::InvalidUrl {
+                        url: location.to_owned(),
+                        source,
+                    })?;
+                    url = parse_http_url(next.as_str())?;
+                    if matches!(response.status, 301..=303) {
+                        form = None;
+                    }
+                }
+                _ => {
+                    return match block::detect(response.status, &response.headers, &response.body) {
+                        Some(block) => Err(WebError::Blocked {
+                            url: url.to_string(),
+                            block,
+                        }),
+                        None => Ok(response),
+                    };
+                }
+            }
+        }
+        Err(WebError::TooManyRedirects(url.to_string()))
     }
 }
 
@@ -323,8 +527,57 @@ fn build_fetcher(config: &Config) -> Result<Fetcher, FetchError> {
     Fetcher::from_builder(builder)
 }
 
-/// Parses `input` as an absolute `http`/`https` URL.
-fn parse_http_url(input: &str) -> Result<Url, WebError> {
+/// How a request presents itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    /// The configured browser impersonation and stealth headers (the default).
+    Browser,
+    /// No impersonation or stealth headers: a plain HTTP client.
+    Plain,
+}
+
+/// Per-request fetcher settings: no automatic redirects, plus cookies, form body, and profile.
+fn request_config(
+    cookies: Option<HashMap<String, String>>,
+    form: Option<&FormPost>,
+    profile: Profile,
+) -> RequestConfig {
+    let plain = profile == Profile::Plain;
+    let mut config = RequestConfig {
+        follow_redirects: Some(FollowRedirects::None),
+        cookies,
+        impersonate: plain.then_some(Impersonate::None),
+        stealthy_headers: plain.then_some(false),
+        ..Default::default()
+    };
+    if let Some(form) = form {
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(&form.fields)
+            .finish();
+        let origin = form.referer.origin().ascii_serialization();
+        config.headers = Some(HashMap::from([
+            (
+                "content-type".to_owned(),
+                "application/x-www-form-urlencoded".to_owned(),
+            ),
+            ("referer".to_owned(), form.referer.to_string()),
+            ("origin".to_owned(), origin),
+        ]));
+        config.data = Some(body.into_bytes());
+    }
+    config
+}
+
+/// Case-insensitive response header lookup.
+fn header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Parses `input` as an absolute `http`/`https` URL that is not an internal address.
+pub fn parse_http_url(input: &str) -> Result<Url, WebError> {
     let url = Url::parse(input.trim()).map_err(|source| WebError::InvalidUrl {
         url: input.to_owned(),
         source,

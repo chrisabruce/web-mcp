@@ -7,12 +7,18 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+askama = "0.16"
 axum = "0.8"
 base64 = "0.22"
+chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 hmac = "0.13"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "ico"] }
+rand = "0.8"
 rmcp = { version = "3", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+# Must match the libsqlite3-sys version scrapling links, so stays on 0.33.
+rusqlite = { version = "0.33", features = ["bundled"] }
 schemars = "1"
 scrapling = { git = "https://github.com/chrisabruce/scrapling-rs" }
 scrapling-fetch = { git = "https://github.com/chrisabruce/scrapling-rs" }

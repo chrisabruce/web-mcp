@@ -6,15 +6,14 @@
 //!    (emitted by [`crate::http`]).
 //! 2. Client reads [`protected_resource`] metadata, then [`authorization_server`] metadata.
 //! 3. Client self-registers at `/register` ([`register`], RFC 7591).
-//! 4. Browser opens `/authorize` ([`authorize_page`]); the user enters the server's access
-//!    token on the login page ([`authorize_submit`]) and is redirected back with a code.
+//! 4. Browser opens `/authorize` ([`authorize_page`]); the user enters their access key on
+//!    the login page ([`authorize_submit`]) and is redirected back with a code.
 //! 5. Client exchanges the code + PKCE verifier at `/token` ([`token()`]) for an access token
 //!    (1 h) and refresh token (30 days), then calls `/mcp` with the access token.
 //!
-//! There is a single "user": whoever knows `WEB_MCP_AUTH_TOKEN`. All OAuth state lives in
-//! signed tokens (see [`mod@token`]), so nothing is stored server-side.
-
-mod token;
+//! Users sign in with `WEB_MCP_AUTH_TOKEN` (the admin) or a user key from the admin UI; issued
+//! tokens carry the user id and are re-checked against the store on every use. All OAuth state lives in
+//! signed tokens (see [`crate::token`]), so nothing about OAuth is stored server-side.
 
 use std::{sync::Arc, time::Duration};
 
@@ -30,8 +29,11 @@ use serde_json::json;
 use tracing::{info, warn};
 use url::Url;
 
-use self::token::{Claims, Signer, expires_in, pkce_matches};
-use crate::config::Secret;
+use crate::{
+    auth::Authenticator,
+    store::UserId,
+    token::{self, Claims, Signer, expires_in, pkce_matches},
+};
 
 /// Lifetime of the signed login-form request.
 const REQUEST_TTL: Duration = Duration::from_secs(10 * 60);
@@ -47,27 +49,26 @@ const LOGIN_HTML: &str = include_str!("login.html");
 
 /// Shared state for the OAuth endpoints and `/mcp` token validation.
 pub struct OAuth {
-    signer: Signer,
-    password: Secret,
+    /// Checks sign-in keys and signs tokens.
+    auth: Authenticator,
     /// Issuer identifier: the public base URL without a trailing slash.
     issuer: String,
 }
 
 impl OAuth {
-    /// Creates the authorization server for `public_url`, secured by `secret`.
+    /// Creates the authorization server for `public_url`.
     ///
-    /// `secret` is both the login password and the root of the token-signing key.
-    pub fn new(public_url: &Url, secret: &Secret) -> Self {
+    /// Users sign in with the master token or their own user key; issued tokens act for that
+    /// user and stop working when the user is revoked.
+    pub fn new(public_url: &Url, auth: Authenticator) -> Self {
         Self {
-            signer: Signer::new(secret.expose()),
-            password: secret.clone(),
+            auth,
             issuer: public_url.as_str().trim_end_matches('/').to_owned(),
         }
     }
 
-    /// Whether `token` is a valid, unexpired access token issued by this server.
-    pub fn verify_access_token(&self, token: &str) -> bool {
-        matches!(self.signer.verify(token), Some(Claims::Access { .. }))
+    fn signer(&self) -> &Signer {
+        self.auth.signer()
     }
 
     /// URL of the protected-resource metadata, advertised in `WWW-Authenticate` on 401s.
@@ -100,11 +101,13 @@ impl OAuth {
         format!("{}{path}", self.issuer)
     }
 
-    fn issue_tokens(&self, client_id: String) -> Response {
-        let access = self.signer.sign(&Claims::Access {
+    fn issue_tokens(&self, uid: UserId, client_id: String) -> Response {
+        let access = self.signer().sign(&Claims::Access {
+            uid,
             exp: expires_in(ACCESS_TTL),
         });
-        let refresh = self.signer.sign(&Claims::Refresh {
+        let refresh = self.signer().sign(&Claims::Refresh {
+            uid,
             client_id,
             exp: expires_in(REFRESH_TTL),
         });
@@ -200,7 +203,7 @@ async fn register(
     let name = req
         .client_name
         .map(|n| n.chars().take(100).collect::<String>());
-    let client_id = oauth.signer.sign(&Claims::Client {
+    let client_id = oauth.signer().sign(&Claims::Client {
         redirect_uris: req.redirect_uris.clone(),
         name: name.clone(),
     });
@@ -261,7 +264,7 @@ fn validate_authorize(oauth: &OAuth, q: AuthorizeQuery) -> Result<(String, Strin
     let Some(Claims::Client {
         redirect_uris,
         name,
-    }) = oauth.signer.verify(&client_id)
+    }) = oauth.signer().verify(&client_id)
     else {
         return Err("unknown client — remove and re-add the connector".into());
     };
@@ -282,7 +285,7 @@ fn validate_authorize(oauth: &OAuth, q: AuthorizeQuery) -> Result<(String, Strin
     }
 
     let client_name = name.unwrap_or_else(|| "An MCP client".into());
-    let request = oauth.signer.sign(&Claims::Request {
+    let request = oauth.signer().sign(&Claims::Request {
         client_id,
         redirect_uri,
         code_challenge,
@@ -310,22 +313,22 @@ async fn authorize_submit(
         code_challenge,
         state,
         ..
-    }) = oauth.signer.verify(&form.request)
+    }) = oauth.signer().verify(&form.request)
     else {
         return error_page(
             StatusCode::BAD_REQUEST,
             "This sign-in request expired. Start again from Claude.",
         );
     };
-    if !oauth.password.matches(form.password.trim()) {
-        warn!("OAuth login failed: wrong access token");
-        let client_name = match oauth.signer.verify(&client_id) {
+    let Some(principal) = oauth.auth.by_key(&form.password).await else {
+        warn!("OAuth login failed: wrong or revoked access key");
+        let client_name = match oauth.signer().verify(&client_id) {
             Some(Claims::Client {
                 name: Some(name), ..
             }) => name,
             _ => "An MCP client".into(),
         };
-        let error = Some("That access token is not correct.");
+        let error = Some("That access key is not correct.");
         return login_page(
             StatusCode::UNAUTHORIZED,
             &oauth,
@@ -333,9 +336,10 @@ async fn authorize_submit(
             &client_name,
             error,
         );
-    }
+    };
 
-    let code = oauth.signer.sign(&Claims::Code {
+    let code = oauth.signer().sign(&Claims::Code {
+        uid: principal.id,
         client_id,
         redirect_uri: redirect_uri.clone(),
         code_challenge,
@@ -346,7 +350,7 @@ async fn authorize_submit(
         .query_pairs_mut()
         .append_pair("code", &code)
         .extend_pairs(state.map(|s| ("state", s)));
-    info!(redirect = %target.host_str().unwrap_or_default(), "OAuth login succeeded");
+    info!(user = %principal.name, redirect = %target.host_str().unwrap_or_default(), "OAuth login succeeded");
     Redirect::to(target.as_str()).into_response()
 }
 
@@ -380,11 +384,12 @@ async fn token(
                 .as_deref()
                 .ok_or_else(|| OAuthError::new("invalid_request", "missing code"))?;
             let Some(Claims::Code {
+                uid,
                 client_id,
                 redirect_uri,
                 code_challenge,
                 ..
-            }) = oauth.signer.verify(code)
+            }) = oauth.signer().verify(code)
             else {
                 return Err(invalid_grant("authorization code is invalid or expired"));
             };
@@ -405,20 +410,24 @@ async fn token(
             if !pkce_matches(verifier, &code_challenge) {
                 return Err(invalid_grant("PKCE verification failed"));
             }
-            Ok(oauth.issue_tokens(client_id))
+            Ok(oauth.issue_tokens(uid, client_id))
         }
         "refresh_token" => {
             let refresh = req
                 .refresh_token
                 .as_deref()
                 .ok_or_else(|| OAuthError::new("invalid_request", "missing refresh_token"))?;
-            let Some(Claims::Refresh { client_id, .. }) = oauth.signer.verify(refresh) else {
+            let Some(Claims::Refresh { uid, client_id, .. }) = oauth.signer().verify(refresh)
+            else {
                 return Err(invalid_grant("refresh token is invalid or expired"));
             };
             if !client_matches(&client_id) {
                 return Err(invalid_grant("client_id does not match the refresh token"));
             }
-            Ok(oauth.issue_tokens(client_id))
+            if oauth.auth.by_id(uid).await.is_none() {
+                return Err(invalid_grant("this access key has been revoked"));
+            }
+            Ok(oauth.issue_tokens(uid, client_id))
         }
         other => Err(OAuthError::new(
             "unsupported_grant_type",
@@ -435,7 +444,7 @@ fn login_page(
     client_name: &str,
     error: Option<&str>,
 ) -> Response {
-    let redirect_host = match oauth.signer.verify(request) {
+    let redirect_host = match oauth.signer().verify(request) {
         Some(Claims::Request { redirect_uri, .. }) => Url::parse(&redirect_uri)
             .ok()
             .and_then(|u| u.host_str().map(str::to_owned))

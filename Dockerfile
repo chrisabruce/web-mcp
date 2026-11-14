@@ -22,11 +22,15 @@ FROM ${REGISTRY}/debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
- && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin web-mcp
+ && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin web-mcp \
+ && install -d -o web-mcp -g web-mcp -m 0700 /data
 COPY --from=build /usr/local/bin/web-mcp /usr/local/bin/web-mcp
 USER web-mcp
 ENV WEB_MCP_BIND=0.0.0.0:8787 \
+    WEB_MCP_DATA_DIR=/data \
     RUST_LOG=info
+# SQLite database: user keys, saved site logins, sessions. Mount a volume here.
+VOLUME /data
 EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8787/health || exit 1

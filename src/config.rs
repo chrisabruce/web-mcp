@@ -98,7 +98,8 @@ pub struct Config {
 
     /// Bearer token clients must send (`Authorization: Bearer <token>`) to use `/mcp`.
     ///
-    /// Required whenever `bind` is not a loopback address; at least 32 characters.
+    /// Required for `serve` and `stdio`; at least 32 characters. Also the admin's key for the
+    /// web UI and the root of the encryption key for stored site logins.
     /// Generate one with `openssl rand -hex 32`.
     #[arg(
         long,
@@ -127,23 +128,30 @@ pub struct Config {
     /// custom connectors can sign in, and adds its host to `allowed_hosts`.
     #[arg(long, env = "WEB_MCP_PUBLIC_URL", value_parser = parse_public_url, global = true)]
     pub public_url: Option<Url>,
+
+    /// Directory for the SQLite database (user keys, saved site logins, sessions).
+    #[arg(long, env = "WEB_MCP_DATA_DIR", default_value = "data", global = true)]
+    pub data_dir: PathBuf,
 }
 
 impl Config {
-    /// Checks settings that only matter when serving over HTTP.
+    /// Returns the master token, which every serving mode requires: it authenticates the
+    /// admin and keys the encryption of stored site passwords and cookies.
     ///
     /// # Errors
     ///
-    /// Refuses to serve on a non-loopback address without an auth token: an open
-    /// "fetch any URL" endpoint is an open proxy for anyone who can reach it.
-    pub fn validate_for_http(&self) -> Result<(), ConfigError> {
-        if self.auth_token.is_none() && !self.bind.ip().is_loopback() {
-            return Err(ConfigError::AuthRequired(self.bind));
+    /// [`ConfigError::AuthRequired`] if `WEB_MCP_AUTH_TOKEN` is not set.
+    pub fn master_token(&self) -> Result<Secret, ConfigError> {
+        self.auth_token.clone().ok_or(ConfigError::AuthRequired)
+    }
+
+    /// The MCP endpoint URL clients should use: under the public URL if set, else the bind
+    /// address.
+    pub fn public_mcp_url(&self) -> String {
+        match &self.public_url {
+            Some(url) => format!("{}/mcp", url.as_str().trim_end_matches('/')),
+            None => format!("http://{}/mcp", self.bind),
         }
-        if self.auth_token.is_none() && self.public_url.is_some() {
-            return Err(ConfigError::OAuthNeedsToken);
-        }
-        Ok(())
     }
 
     /// `Host` header values accepted on `/mcp`: the configured list plus the public URL's host.
@@ -175,15 +183,12 @@ fn parse_public_url(input: &str) -> Result<Url, String> {
 /// Invalid combinations of settings, detected after parsing.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// Serving publicly without authentication.
+    /// The master token is missing.
     #[error(
-        "refusing to listen on {0} without WEB_MCP_AUTH_TOKEN; set a token \
-         (e.g. `openssl rand -hex 32`) or bind to 127.0.0.1"
+        "WEB_MCP_AUTH_TOKEN is required: it is the admin login and encrypts stored site \
+         logins. Generate one with `openssl rand -hex 32`"
     )]
-    AuthRequired(SocketAddr),
-    /// OAuth signs tokens with, and logs users in with, the auth token.
-    #[error("WEB_MCP_PUBLIC_URL enables OAuth, which also requires WEB_MCP_AUTH_TOKEN")]
-    OAuthNeedsToken,
+    AuthRequired,
 }
 
 /// Minimum accepted length for [`Secret`] tokens.

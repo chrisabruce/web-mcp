@@ -8,7 +8,9 @@ services:
     image: web-mcp:latest
     restart: unless-stopped
     environment:
-      # Required: the access token / OAuth login password. `openssl rand -hex 32`
+      # Required: the admin key (web UI at /admin, Claude sign-in) and the root of the
+      # encryption key for stored site logins. `openssl rand -hex 32`. Changing it signs
+      # everyone out and makes saved site passwords/cookies unreadable (user keys survive).
       WEB_MCP_AUTH_TOKEN: ${WEB_MCP_AUTH_TOKEN:?set WEB_MCP_AUTH_TOKEN}
       # Required: public HTTPS base URL (enables OAuth; its host is auto-allowed).
       WEB_MCP_PUBLIC_URL: ${WEB_MCP_PUBLIC_URL:?set WEB_MCP_PUBLIC_URL, e.g. https://mcp.example.com}
@@ -22,6 +24,9 @@ services:
       WEB_MCP_IMPERSONATE: ${WEB_MCP_IMPERSONATE:-chrome}
       WEB_MCP_SEARCH_ENGINES: ${WEB_MCP_SEARCH_ENGINES:-duckduckgo-lite,bing,duckduckgo-html}
       RUST_LOG: ${RUST_LOG:-info}
+    # User keys, saved site logins, and sessions (SQLite). Keep this volume when redeploying.
+    volumes:
+      - web-mcp-data:/data
     # Reached through Dokploy's Traefik; not published on the host.
     expose:
       - "8787"
@@ -32,6 +37,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+
+volumes:
+  web-mcp-data:
 
 networks:
   dokploy-network:

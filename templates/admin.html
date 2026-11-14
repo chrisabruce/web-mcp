@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}web-mcp admin{% endblock %}
+{% block body %}
+<header>
+  <h1>web-mcp</h1>
+  <div>
+    <span class="muted">Signed in as <strong>{{ user_name }}</strong>{% if is_admin %} <span class="tag">admin</span>{% endif %}</span>
+    <form class="inline" method="post" action="/admin/logout"><button class="secondary" type="submit">Sign out</button></form>
+  </div>
+</header>
+<main>
+  {% if let Some(message) = message %}<div class="notice ok">{{ message }}</div>{% endif %}
+  {% if let Some(error) = error %}<div class="notice err">{{ error }}</div>{% endif %}
+
+  {% if let Some(created) = created_key %}
+  <div class="notice ok">
+    <strong>Key for {{ created.0 }}</strong>: copy it now, it will not be shown again.
+    <p class="key">{{ created.1 }}</p>
+    <p class="muted">Claude Desktop / claude.ai: add a custom connector for <code>{{ mcp_url }}</code> and sign in with this key.<br>
+    Claude Code: <code>claude mcp add --transport http web {{ mcp_url }} --header "Authorization: Bearer &lt;key&gt;"</code></p>
+  </div>
+  {% endif %}
+
+  <section>
+    <h2>Site logins</h2>
+    <p class="muted">Logins and sessions are private to your key and encrypted at rest. Claude uses a site's session automatically in <code>fetch_url</code> and <code>fetch_image</code>, and can log in with a saved password via <code>site_login</code>.</p>
+    {% if sites.is_empty() %}
+      <p class="muted">No sites yet.</p>
+    {% else %}
+    <table>
+      <thead><tr><th>Site</th><th>Login</th><th>Session</th><th>Updated</th><th></th></tr></thead>
+      <tbody>
+      {% for site in sites %}
+        <tr>
+          <td><strong>{{ site.domain }}</strong>{% if let Some(url) = site.login_url %}<br><span class="muted">{{ url }}</span>{% endif %}</td>
+          <td>{{ site.login }}</td>
+          <td>{{ site.session }}</td>
+          <td class="muted">{{ site.updated }}</td>
+          <td>
+            {% if site.can_login %}<form class="inline" method="post" action="/admin/sites/login"><input type="hidden" name="domain" value="{{ site.domain }}"><button class="secondary" type="submit">Log in now</button></form>{% endif %}
+            {% if site.has_session %}<form class="inline" method="post" action="/admin/sites/logout"><input type="hidden" name="domain" value="{{ site.domain }}"><button class="secondary" type="submit">End session</button></form>{% endif %}
+            <form class="inline" method="post" action="/admin/sites/delete"><input type="hidden" name="domain" value="{{ site.domain }}"><button class="danger" type="submit">Delete</button></form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    <fieldset>
+      <legend>Save a username &amp; password</legend>
+      <form method="post" action="/admin/sites">
+        <div class="row">
+          <div><label for="s-domain">Site domain</label><input id="s-domain" name="domain" placeholder="craigslist.org" required></div>
+          <div><label for="s-url">Login page URL <span class="muted">(optional)</span></label><input id="s-url" name="login_url" placeholder="https://accounts.craigslist.org/login"></div>
+        </div>
+        <div class="row">
+          <div><label for="s-user">Username or email</label><input id="s-user" name="username" autocomplete="off" required></div>
+          <div><label for="s-pass">Password <span class="muted">(leave blank to keep the saved one)</span></label><input id="s-pass" name="password" type="password" autocomplete="new-password"></div>
+        </div>
+        <button type="submit">Save login</button>
+      </form>
+    </fieldset>
+
+    <fieldset>
+      <legend>Import browser cookies</legend>
+      <p class="muted">For sites that log in with JavaScript, CAPTCHAs, or 2FA: log in with your own browser, then paste its cookies for that site. Accepted: a <code>Cookie:</code> header from developer tools, a JSON export (e.g. Cookie-Editor), or <code>cookies.txt</code>.</p>
+      <form method="post" action="/admin/sites/cookies">
+        <label for="c-domain">Site domain</label><input id="c-domain" name="domain" placeholder="craigslist.org" required>
+        <label for="c-cookies">Cookies</label><textarea id="c-cookies" name="cookies" required></textarea>
+        <button type="submit">Import cookies</button>
+      </form>
+    </fieldset>
+  </section>
+
+  {% if is_admin %}
+  <section>
+    <h2>User keys</h2>
+    <p class="muted">Each key is a separate user with its own site logins. Keys work as Claude Code bearer tokens and as the sign-in password for Claude Desktop / claude.ai. Revoking a key ends its sessions immediately.</p>
+    <table>
+      <thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+      {% for u in users %}
+        <tr>
+          <td><strong>{{ u.name }}</strong></td>
+          <td><code>{{ u.key }}</code></td>
+          <td class="muted">{{ u.created }}</td>
+          <td class="muted">{{ u.last_used }}</td>
+          <td>{{ u.status }}</td>
+          <td>{% if u.revocable %}<form class="inline" method="post" action="/admin/users/{{ u.id }}/revoke"><button class="danger" type="submit">Revoke</button></form>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <fieldset>
+      <legend>Create a key</legend>
+      <form method="post" action="/admin/users">
+        <label for="u-name">Name</label><input id="u-name" name="name" placeholder="alice" required maxlength="64">
+        <button type="submit">Create key</button>
+      </form>
+    </fieldset>
+  </section>
+  {% endif %}
+</main>
+{% endblock %}

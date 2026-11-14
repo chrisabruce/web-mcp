@@ -1,17 +1,18 @@
-//! Stateless, HMAC-signed tokens for every artifact of the OAuth flow.
+//! Stateless, HMAC-signed tokens: OAuth artifacts and admin-UI sessions.
 //!
-//! The server keeps no OAuth state: client registrations, pending authorization requests,
-//! authorization codes, and access/refresh tokens are all [`Claims`] serialized to JSON,
-//! base64url-encoded, and signed with HMAC-SHA256:
+//! The server keeps no session state: OAuth client registrations, pending authorization
+//! requests, authorization codes, access/refresh tokens, and admin-UI session cookies are all
+//! [`Claims`] serialized to JSON, base64url-encoded, and signed with HMAC-SHA256:
 //!
 //! ```text
 //!   base64url(json(claims)) "." base64url(hmac_sha256(key, payload))
 //! ```
 //!
-//! This survives restarts and works on a read-only filesystem. The signing key is derived
-//! from the server's auth token ([`Signer::new`]), so rotating that token revokes every
-//! client registration and session at once. Each claim kind is a distinct enum variant, so
-//! a token of one kind can never be accepted where another is expected.
+//! This survives restarts. The signing key is derived from the server's auth token
+//! ([`Signer::new`]), so rotating that token revokes every client registration and session at
+//! once. Tokens that act on behalf of a user carry its [`UserId`]; whoever verifies them must
+//! also check that the user still exists and is not revoked (see [`crate::auth`]). Each claim
+//! kind is a distinct enum variant, so a token of one kind is never accepted as another.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +20,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+
+use crate::store::UserId;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -51,6 +54,8 @@ pub enum Claims {
     },
     /// A one-time authorization code.
     Code {
+        /// User who signed in.
+        uid: UserId,
         /// Client the code was issued to.
         client_id: String,
         /// Redirect URI that must be repeated at the token endpoint.
@@ -62,13 +67,24 @@ pub enum Claims {
     },
     /// A bearer token accepted by `/mcp`.
     Access {
+        /// User the token acts for.
+        uid: UserId,
         /// Expiry (Unix seconds).
         exp: u64,
     },
     /// A token exchangeable for a fresh access/refresh pair.
     Refresh {
+        /// User the token acts for.
+        uid: UserId,
         /// Client the token was issued to.
         client_id: String,
+        /// Expiry (Unix seconds).
+        exp: u64,
+    },
+    /// An admin-UI session cookie.
+    UiSession {
+        /// Signed-in user.
+        uid: UserId,
         /// Expiry (Unix seconds).
         exp: u64,
     },
@@ -81,8 +97,9 @@ impl Claims {
             Self::Client { .. } => false,
             Self::Request { exp, .. }
             | Self::Code { exp, .. }
-            | Self::Access { exp }
-            | Self::Refresh { exp, .. } => *exp <= now(),
+            | Self::Access { exp, .. }
+            | Self::Refresh { exp, .. }
+            | Self::UiSession { exp, .. } => *exp <= now(),
         }
     }
 }
@@ -96,11 +113,8 @@ pub struct Signer {
 impl Signer {
     /// Derives the signing key from the server's auth `secret`.
     pub fn new(secret: &str) -> Self {
-        let mut mac =
-            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
-        mac.update(KEY_CONTEXT);
         Self {
-            key: mac.finalize().into_bytes().into(),
+            key: derive_key(secret, KEY_CONTEXT),
         }
     }
 
@@ -125,6 +139,17 @@ impl Signer {
         mac.update(payload.as_bytes());
         mac
     }
+}
+
+/// Derives an independent 256-bit key from `secret` for one `context` (HMAC-SHA256).
+///
+/// Used for the token-signing key here and the storage encryption key in [`crate::store`], so
+/// one master secret yields unrelated keys for unrelated purposes.
+pub fn derive_key(secret: &str, context: &[u8]) -> [u8; 32] {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(context);
+    mac.finalize().into_bytes().into()
 }
 
 /// Seconds since the Unix epoch.
@@ -158,13 +183,14 @@ mod tests {
     fn round_trips_and_rejects_tampering() {
         let signer = signer();
         let claims = Claims::Access {
+            uid: UserId(7),
             exp: expires_in(Duration::from_secs(60)),
         };
         let token = signer.sign(&claims);
         assert_eq!(signer.verify(&token), Some(claims));
 
         let (payload, sig) = token.split_once('.').unwrap();
-        let forged = URL_SAFE_NO_PAD.encode(br#"{"typ":"access","exp":99999999999}"#);
+        let forged = URL_SAFE_NO_PAD.encode(br#"{"typ":"access","uid":1,"exp":99999999999}"#);
         assert_eq!(signer.verify(&format!("{forged}.{sig}")), None);
         assert_eq!(signer.verify(payload), None);
         assert_eq!(
@@ -175,7 +201,10 @@ mod tests {
 
     #[test]
     fn rejects_expired_tokens() {
-        let token = signer().sign(&Claims::Access { exp: now() - 1 });
+        let token = signer().sign(&Claims::Access {
+            uid: UserId(1),
+            exp: now() - 1,
+        });
         assert_eq!(signer().verify(&token), None);
     }
 

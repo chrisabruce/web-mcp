@@ -36,6 +36,18 @@ pub struct Block {
     pub status: u16,
 }
 
+/// Reason given to a bare `403` with no recognisable anti-bot vendor.
+const GENERIC_DENIAL: &str = "access denied";
+
+impl Block {
+    /// Whether this is a bare `403` with no recognised vendor signature. Such denials are
+    /// sometimes triggered by the browser impersonation itself, so they are worth one retry
+    /// with a plain client; vendor challenges are not.
+    pub fn is_generic_denial(&self) -> bool {
+        self.reason == GENERIC_DENIAL
+    }
+}
+
 impl fmt::Display for Block {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} (HTTP {})", self.reason, self.status)
@@ -185,7 +197,7 @@ pub fn detect(status: u16, headers: &HashMap<String, String>, body: &[u8]) -> Op
     match status {
         403 if server.contains("cloudflare") => block("Cloudflare firewall block"),
         403 if server.contains("akamai") => block("Akamai block"),
-        403 => block("access denied"),
+        403 => block(GENERIC_DENIAL),
         429 => block("rate limited"),
         _ => None,
     }

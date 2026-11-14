@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Sign in · web-mcp{% endblock %}
+{% block body %}
+<main style="width: min(24rem, 100% - 2rem); margin-top: 10vh">
+  <h2>web-mcp</h2>
+  <p class="muted">Sign in with your access key to manage your site logins.</p>
+  {% if let Some(error) = error %}<div class="notice err">{{ error }}</div>{% endif %}
+  <form method="post" action="/admin/login">
+    <label for="key">Access key</label>
+    <input id="key" name="key" type="password" autocomplete="current-password" required autofocus>
+    <button type="submit">Sign in</button>
+  </form>
+</main>
+{% endblock %}
