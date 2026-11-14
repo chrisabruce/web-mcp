@@ -14,7 +14,7 @@
 
   {% if let Some(created) = created_key %}
   <div class="notice ok">
-    <strong>Key for {{ created.0 }}</strong>: copy it now, it will not be shown again.
+    <strong>Key for {{ created.0 }}</strong> (you can view it again later under User keys):
     <p class="key">{{ created.1 }}</p>
     <p class="muted">Claude Desktop / claude.ai: add a custom connector for <code>{{ mcp_url }}</code> and sign in with this key.<br>
     Claude Code: <code>claude mcp add --transport http web {{ mcp_url }} --header "Authorization: Bearer &lt;key&gt;"</code></p>
@@ -76,18 +76,27 @@
   {% if is_admin %}
   <section>
     <h2>User keys</h2>
-    <p class="muted">Each key is a separate user with its own site logins. Keys work as Claude Code bearer tokens and as the sign-in password for Claude Desktop / claude.ai. Revoking a key ends its sessions immediately.</p>
+    <p class="muted">Each key is a separate user with its own site logins. Keys work as Claude Code bearer tokens and as the sign-in password for Claude Desktop / claude.ai. Click <em>Show</em> to view a key. <em>New key</em> replaces a key (the old one stops working); <em>Revoke</em> disables the user and ends all their sessions immediately.</p>
     <table>
       <thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr></thead>
       <tbody>
       {% for u in users %}
         <tr>
           <td><strong>{{ u.name }}</strong></td>
-          <td><code>{{ u.key }}</code></td>
+          <td>
+            {% if let Some(key) = u.full_key %}
+            <details><summary><code>{{ u.key_prefix }}</code> Show</summary><p class="key">{{ key }}</p></details>
+            {% else %}
+            <code>{{ u.key_prefix }}</code>{% if !u.key_note.is_empty() %}<br><span class="muted">{{ u.key_note }}</span>{% endif %}
+            {% endif %}
+          </td>
           <td class="muted">{{ u.created }}</td>
           <td class="muted">{{ u.last_used }}</td>
           <td>{{ u.status }}</td>
-          <td>{% if u.revocable %}<form class="inline" method="post" action="/admin/users/{{ u.id }}/revoke"><button class="danger" type="submit">Revoke</button></form>{% endif %}</td>
+          <td>{% if u.revocable %}
+            <form class="inline" method="post" action="/admin/users/{{ u.id }}/regenerate"><button class="secondary" type="submit">New key</button></form>
+            <form class="inline" method="post" action="/admin/users/{{ u.id }}/revoke"><button class="danger" type="submit">Revoke</button></form>
+          {% endif %}</td>
         </tr>
       {% endfor %}
       </tbody>

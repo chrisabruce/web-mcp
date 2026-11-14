@@ -2,19 +2,20 @@
 //!
 //! # Schema
 //!
-//! * `users`: one row per access key. Keys are stored only as SHA-256 hashes (plus a short
-//!   display prefix). The built-in `admin` user has no key; it is authenticated by the master
-//!   `WEB_MCP_AUTH_TOKEN` instead (see [`crate::auth`]).
+//! * `users`: one row per access key. Keys are looked up by SHA-256 hash, and also stored
+//!   encrypted so the admin can view them in the UI. The built-in `admin` user has no key; it
+//!   is authenticated by the master `WEB_MCP_AUTH_TOKEN` instead (see [`crate::auth`]).
 //! * `sites`: per user and site domain, an optional saved login (username, encrypted
 //!   password, login URL) and an optional encrypted [`CookieJar`] holding the session.
 //!
 //! # Secrets at rest
 //!
-//! Site passwords and cookie jars are encrypted with ChaCha20-Poly1305 under a key derived
+//! User keys, site passwords, and cookie jars are encrypted with ChaCha20-Poly1305 under a key derived
 //! from the master token ([`crate::token::derive_key`]); the associated data binds each blob
 //! to its user, domain, and purpose, so blobs cannot be swapped between rows. A stolen database
 //! file is therefore useless without the master token. Rotating the master token makes stored
-//! secrets unreadable; they are then treated as absent and must be re-entered.
+//! secrets unreadable; they are then treated as absent and must be re-entered. (User keys keep
+//! *working*, since authentication uses the hash, but can no longer be displayed.)
 //!
 //! # Concurrency
 //!
@@ -54,10 +55,10 @@ const STORAGE_KEY_CONTEXT: &[u8] = b"web-mcp storage encryption key v1";
 /// `users.last_used_at` is only rewritten when older than this, to avoid a write per request.
 const LAST_USED_RESOLUTION_SECS: u64 = 60;
 
-/// Current schema version (SQLite `user_version`).
-const SCHEMA_VERSION: i64 = 1;
+/// Schema migrations; entry `n` upgrades `user_version` `n` to `n + 1`.
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, "ALTER TABLE users ADD COLUMN key_enc BLOB;"];
 
-const SCHEMA: &str = "
+const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS users (
     id           INTEGER PRIMARY KEY,
     name         TEXT    NOT NULL UNIQUE,
@@ -113,6 +114,28 @@ impl User {
     pub fn is_admin(&self) -> bool {
         self.key_prefix.is_none()
     }
+}
+
+/// A user row plus its key, for the admin's user list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserListing {
+    /// The user.
+    pub user: User,
+    /// Its key, as far as it can be shown.
+    pub key: KeyView,
+}
+
+/// Whether a user's key can be displayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyView {
+    /// The built-in admin, whose key is `WEB_MCP_AUTH_TOKEN`.
+    Master,
+    /// The decrypted key.
+    Visible(String),
+    /// Created before keys were stored encrypted; regenerate it to view.
+    NotStored,
+    /// Stored, but encrypted under a previous `WEB_MCP_AUTH_TOKEN`.
+    Unreadable,
 }
 
 /// How a site's cookie jar was obtained.
@@ -201,6 +224,9 @@ pub enum StoreError {
     /// The user name is empty, too long, reserved, or has odd characters.
     #[error("user names must be 1-64 letters, digits, spaces, `.`, `_`, `-`, `@`, and not `admin`")]
     InvalidName,
+    /// No active user has that id.
+    #[error("no active user with that id")]
+    UnknownUser,
     /// The built-in admin cannot be revoked.
     #[error("the built-in admin cannot be revoked; rotate WEB_MCP_AUTH_TOKEN instead")]
     CannotRevokeAdmin,
@@ -274,7 +300,8 @@ impl Store {
         }
         let key = generate_key();
         let (hash, prefix) = (hash_key(&key), key[..KEY_PREFIX.len() + 6].to_owned());
-        self.call(move |conn, _| {
+        let stored_key = key.clone();
+        self.call(move |conn, cipher| {
             let created = now();
             let inserted = conn.execute(
                 "INSERT INTO users (name, key_hash, key_prefix, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -288,8 +315,10 @@ impl Store {
                 }
                 other => other?,
             };
+            let id = UserId(conn.last_insert_rowid());
+            store_key(conn, cipher, id, &stored_key)?;
             let user = User {
-                id: UserId(conn.last_insert_rowid()),
+                id,
                 name,
                 key_prefix: Some(prefix),
                 created_at: created,
@@ -301,16 +330,52 @@ impl Store {
         .await
     }
 
-    /// All users, admin first, then by creation.
-    pub async fn list_users(&self) -> Result<Vec<User>, StoreError> {
-        self.call(|conn, _| {
+    /// All users with their (decrypted) keys, admin first, then by creation. Admin only.
+    pub async fn list_users(&self) -> Result<Vec<UserListing>, StoreError> {
+        self.call(|conn, cipher| {
             let mut stmt = conn.prepare(&format!(
-                "{USER_COLUMNS} FROM users ORDER BY key_prefix IS NOT NULL, created_at"
+                "{USER_COLUMNS}, key_enc FROM users ORDER BY key_prefix IS NOT NULL, created_at"
             ))?;
-            let users = stmt
-                .query_map([], user_from_row)?
-                .collect::<Result<_, _>>()?;
-            Ok(users)
+            let rows = stmt.query_map([], |row| {
+                Ok((user_from_row(row)?, row.get::<_, Option<Vec<u8>>>(6)?))
+            })?;
+            let mut listings = Vec::new();
+            for row in rows {
+                let (user, sealed) = row?;
+                let key = match (user.is_admin(), sealed) {
+                    (true, _) => KeyView::Master,
+                    (false, None) => KeyView::NotStored,
+                    (false, Some(blob)) => cipher
+                        .open_text(&blob, Purpose::UserKey, user.id, "")
+                        .map_or(KeyView::Unreadable, KeyView::Visible),
+                };
+                listings.push(UserListing { user, key });
+            }
+            Ok(listings)
+        })
+        .await
+    }
+
+    /// Replaces an active user's key with a new one (the old key stops working at once;
+    /// existing OAuth sign-ins continue). Returns the user and the new key.
+    pub async fn regenerate_key(&self, id: UserId) -> Result<(User, String), StoreError> {
+        if id == self.admin {
+            return Err(StoreError::CannotRevokeAdmin);
+        }
+        let key = generate_key();
+        let (hash, prefix) = (hash_key(&key), key[..KEY_PREFIX.len() + 6].to_owned());
+        let stored_key = key.clone();
+        self.call(move |conn, cipher| {
+            let changed = conn.execute(
+                "UPDATE users SET key_hash = ?1, key_prefix = ?2 WHERE id = ?3 AND revoked_at IS NULL",
+                params![hash, prefix, id.0],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::UnknownUser);
+            }
+            store_key(conn, cipher, id, &stored_key)?;
+            let user = conn.query_row(&format!("{USER_COLUMNS} FROM users WHERE id = ?1"), params![id.0], user_from_row)?;
+            Ok((user, stored_key))
         })
         .await
     }
@@ -552,10 +617,13 @@ fn init(conn: &Connection) -> Result<UserId, StoreError> {
     // WAL is unavailable for in-memory databases; ignore the result there.
     let _ = conn.pragma_update(None, "journal_mode", "WAL");
 
-    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version < SCHEMA_VERSION {
-        conn.execute_batch(SCHEMA)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    let version: usize = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    for (index, migration) in MIGRATIONS.iter().enumerate().skip(version) {
+        conn.execute_batch(&format!(
+            "BEGIN; {migration} PRAGMA user_version = {}; COMMIT;",
+            index + 1
+        ))?;
+        info!(version = index + 1, "migrated database schema");
     }
     conn.execute(
         "INSERT OR IGNORE INTO users (name, key_hash, key_prefix, created_at) VALUES (?1, NULL, NULL, ?2)",
@@ -567,6 +635,16 @@ fn init(conn: &Connection) -> Result<UserId, StoreError> {
         |row| row.get(0),
     )?;
     Ok(UserId(id))
+}
+
+/// Stores `key` encrypted for user `id`, so the admin can view it later.
+fn store_key(conn: &Connection, cipher: &Cipher, id: UserId, key: &str) -> rusqlite::Result<()> {
+    let sealed = cipher.seal(key.as_bytes(), Purpose::UserKey, id, "");
+    conn.execute(
+        "UPDATE users SET key_enc = ?1 WHERE id = ?2",
+        params![sealed, id.0],
+    )?;
+    Ok(())
 }
 
 /// Records a use of `id`, at most once per [`LAST_USED_RESOLUTION_SECS`].
@@ -604,6 +682,7 @@ fn hash_key(key: &str) -> Vec<u8> {
 enum Purpose {
     Password,
     Cookies,
+    UserKey,
 }
 
 /// Authenticated encryption for secrets at rest.
@@ -700,7 +779,10 @@ mod tests {
             Err(StoreError::InvalidName)
         ));
 
-        let users = store.list_users().await.unwrap();
+        let listed = store.list_users().await.unwrap();
+        assert_eq!(listed[0].key, KeyView::Master);
+        assert_eq!(listed[1].key, KeyView::Visible(key.clone()));
+        let users: Vec<User> = listed.into_iter().map(|l| l.user).collect();
         assert_eq!(
             users.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
             ["admin", "alice"]
@@ -714,6 +796,72 @@ mod tests {
             store.revoke_user(store.admin_id()).await,
             Err(StoreError::CannotRevokeAdmin)
         ));
+    }
+
+    #[tokio::test]
+    async fn keys_are_viewable_and_regenerable() {
+        let store = Store::in_memory(&secret("master"));
+        let (alice, old_key) = store.create_user("alice").await.unwrap();
+        let (_, new_key) = store.regenerate_key(alice.id).await.unwrap();
+        assert_ne!(old_key, new_key);
+        assert_eq!(store.user_by_key(&old_key).await.unwrap(), None);
+        assert_eq!(
+            store.user_by_key(&new_key).await.unwrap().map(|u| u.id),
+            Some(alice.id)
+        );
+        assert_eq!(
+            store.list_users().await.unwrap()[1].key,
+            KeyView::Visible(new_key.clone())
+        );
+        assert!(matches!(
+            store.regenerate_key(store.admin_id()).await,
+            Err(StoreError::CannotRevokeAdmin)
+        ));
+
+        // With a different master token the key still authenticates but cannot be shown.
+        let rotated = Store::from_connection(
+            Arc::try_unwrap(store.conn)
+                .ok()
+                .unwrap()
+                .into_inner()
+                .unwrap(),
+            &secret("rotated"),
+            store.admin,
+        );
+        assert_eq!(
+            rotated.list_users().await.unwrap()[1].key,
+            KeyView::Unreadable
+        );
+        assert!(rotated.user_by_key(&new_key).await.unwrap().is_some());
+
+        rotated.revoke_user(alice.id).await.unwrap();
+        assert!(matches!(
+            rotated.regenerate_key(alice.id).await,
+            Err(StoreError::UnknownUser)
+        ));
+    }
+
+    #[test]
+    fn migrates_v1_databases_and_marks_legacy_keys_not_stored() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO users (name, key_hash, key_prefix, created_at) VALUES ('old', x'00', 'wmk_abcdef', 1)",
+            [],
+        )
+        .unwrap();
+        let admin = init(&conn).unwrap();
+        let store = Store::from_connection(conn, &secret("master"), admin);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listed = rt.block_on(store.list_users()).unwrap();
+        assert_eq!(
+            listed.iter().map(|l| &l.key).collect::<Vec<_>>(),
+            [&KeyView::Master, &KeyView::NotStored]
+        );
     }
 
     #[tokio::test]

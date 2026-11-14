@@ -31,7 +31,7 @@ use crate::{
     auth::{Authenticator, Principal},
     cookies::{normalize_domain, parse_import},
     sites::Sites,
-    store::{CookieSource, StoreError, UserId},
+    store::{CookieSource, KeyView, StoreError, UserId, UserListing},
     token::{Claims, expires_in, now},
 };
 
@@ -63,6 +63,7 @@ pub fn routes(state: Arc<AdminState>) -> Router {
         .route("/admin/logout", post(logout))
         .route("/admin/users", post(create_user))
         .route("/admin/users/{id}/revoke", post(revoke_user))
+        .route("/admin/users/{id}/regenerate", post(regenerate_key))
         .route("/admin/sites", post(save_site))
         .route("/admin/sites/cookies", post(import_cookies))
         .route("/admin/sites/login", post(site_login))
@@ -173,7 +174,12 @@ struct SiteRow {
 struct UserRow {
     id: UserId,
     name: String,
-    key: String,
+    /// Short prefix shown in the table.
+    key_prefix: String,
+    /// The full key, if it can be shown.
+    full_key: Option<String>,
+    /// Why the full key cannot be shown, otherwise.
+    key_note: &'static str,
     created: String,
     last_used: String,
     status: &'static str,
@@ -241,26 +247,47 @@ async fn render_dashboard(state: &AdminState, user: &Principal, flash: Flash) ->
                 domain: s.domain,
             })
             .collect(),
-        users: users
-            .into_iter()
-            .map(|u| UserRow {
-                revocable: !u.is_admin() && u.revoked_at.is_none(),
-                status: match (u.is_admin(), u.revoked_at) {
-                    (true, _) => "master token",
-                    (false, Some(_)) => "revoked",
-                    (false, None) => "active",
-                },
-                key: u
-                    .key_prefix
-                    .clone()
-                    .map_or_else(|| "WEB_MCP_AUTH_TOKEN".into(), |p| format!("{p}…")),
-                created: ago(u.created_at),
-                last_used: u.last_used_at.map_or_else(|| "never".into(), ago),
-                id: u.id,
-                name: u.name,
-            })
-            .collect(),
+        users: users.into_iter().map(user_row).collect(),
     })
+}
+
+/// Builds the user-table row for one listing.
+fn user_row(UserListing { user: u, key }: UserListing) -> UserRow {
+    let (full_key, key_note) = match key {
+        KeyView::Visible(key) => (Some(key), ""),
+        KeyView::Master => (None, "the WEB_MCP_AUTH_TOKEN environment variable"),
+        KeyView::NotStored => (
+            None,
+            "not stored (created before keys were viewable); use New key",
+        ),
+        KeyView::Unreadable => (
+            None,
+            "unreadable since WEB_MCP_AUTH_TOKEN changed; use New key",
+        ),
+    };
+    let active = !u.is_admin() && u.revoked_at.is_none();
+    UserRow {
+        revocable: active,
+        status: match (u.is_admin(), u.revoked_at) {
+            (true, _) => "master token",
+            (false, Some(_)) => "revoked",
+            (false, None) => "active",
+        },
+        key_prefix: u
+            .key_prefix
+            .clone()
+            .map_or_else(|| "master".into(), |p| format!("{p}…")),
+        full_key: full_key.filter(|_| active),
+        key_note: if active || u.is_admin() {
+            key_note
+        } else {
+            "revoked"
+        },
+        created: ago(u.created_at),
+        last_used: u.last_used_at.map_or_else(|| "never".into(), ago),
+        id: u.id,
+        name: u.name,
+    }
 }
 
 /// "5 min ago"-style relative time.
@@ -406,6 +433,31 @@ async fn revoke_user(
             done("user-revoked")
         }
         Err(err @ StoreError::CannotRevokeAdmin) => {
+            show_error(&state, &user, err.to_string()).await
+        }
+        Err(err) => store_failure(&err),
+    }
+}
+
+async fn regenerate_key(
+    State(state): AppState,
+    UiUser(user): UiUser,
+    Path(id): Path<i64>,
+) -> Response {
+    if !user.is_admin {
+        return (StatusCode::FORBIDDEN, "admin only").into_response();
+    }
+    match state.auth.store().regenerate_key(UserId(id)).await {
+        Ok((changed, key)) => {
+            info!(admin = %user.name, user = %changed.name, "regenerated user key");
+            let flash = Flash {
+                created_key: Some((changed.name, key)),
+                message: Some("New key issued. The old key no longer works; Claude Desktop sign-ins made with it continue until they expire or the user is revoked.".into()),
+                ..Flash::default()
+            };
+            render_dashboard(&state, &user, flash).await
+        }
+        Err(err @ (StoreError::UnknownUser | StoreError::CannotRevokeAdmin)) => {
             show_error(&state, &user, err.to_string()).await
         }
         Err(err) => store_failure(&err),

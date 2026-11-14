@@ -497,7 +497,7 @@ mod tests {
                 send(&app, ui_post("/admin/users", "name=alice".into(), &admin)).await;
             assert_eq!(status, StatusCode::OK);
             let start = page.find("wmk_").expect("new key shown");
-            let alice_key = page[start..start + 68].to_owned();
+            let mut alice_key = page[start..start + 68].to_owned();
 
             // Cross-origin form posts are refused even with a valid session.
             let mut forged = ui_post("/admin/users", "name=mallory".into(), &admin);
@@ -554,6 +554,41 @@ mod tests {
                 !alice_page.contains("abc"),
                 "cookie values must never be rendered"
             );
+
+            // The admin can view alice's key later; alice's own page never shows keys.
+            let (_, _, admin_page) = send(&app, ui_get("/admin", &admin)).await;
+            assert!(
+                admin_page.contains(&alice_key),
+                "admin should be able to view the key"
+            );
+            assert!(!alice_page.contains("wmk_"));
+
+            // "New key" replaces alice's key: the old one stops working immediately.
+            let (status, _, page) = send(
+                &app,
+                ui_post(
+                    &format!("/admin/users/{alice_id}/regenerate"),
+                    String::new(),
+                    &admin,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let start = page.find("wmk_").expect("new key shown");
+            let old_key = std::mem::replace(&mut alice_key, page[start..start + 68].to_owned());
+            assert_ne!(old_key, alice_key);
+            assert_eq!(
+                send(&app, mcp_ping(&old_key)).await.0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(send(&app, mcp_ping(&alice_key)).await.0, StatusCode::OK);
+            // Regenerating is admin-only.
+            let attempt = ui_post(
+                &format!("/admin/users/{alice_id}/regenerate"),
+                String::new(),
+                &alice,
+            );
+            assert_eq!(send(&app, attempt).await.0, StatusCode::FORBIDDEN);
 
             // Alice signs in to Claude Desktop with her key (OAuth) and gets her own token.
             let access = oauth_access_token(&app, &alice_key).await;

@@ -39,10 +39,11 @@ saved logins, sessions). Keep that volume when you redeploy.
 
 Open `https://mcp.example.com/admin` and sign in with `WEB_MCP_AUTH_TOKEN`.
 
-- **User keys** (admin only): create a named key for each person (`wmk_…`). The key is shown
-  once, so copy it straight away. Each person uses their key exactly where you'd use the master
-  token: as the Claude Desktop sign-in password, or as a Claude Code bearer token. **Revoke**
-  works immediately on the key, its Claude Desktop sessions, and its UI sign-in.
+- **User keys** (admin only): create a named key for each person (`wmk_…`). Click **Show** to
+  view a key at any time. Each person uses their key exactly where you'd use the master token:
+  as the Claude Desktop sign-in password, or as a Claude Code bearer token. **New key** replaces a
+  key, and the old one stops working at once. **Revoke** disables the user immediately: their
+  key, their Claude Desktop sessions, and their UI sign-in.
 - **Site logins** (everyone, with their own key): each user manages their own sites here.
   - **Save a username & password**: Claude then logs in on demand (`site_login`, or
     `use_login: true`). This works for normal HTML login forms, including ones with hidden CSRF
@@ -87,12 +88,12 @@ To test the image locally, copy `.env.example` to `.env`, set a token, and run
 - **Auth is mandatory.** The server won't start without `WEB_MCP_AUTH_TOKEN` (32 or more
   characters). `/mcp` accepts the master token, an active user key, or an OAuth access token,
   and checks the user on every request, so a revocation applies immediately. User keys are
-  stored only as SHA-256 hashes.
-- **Secrets at rest.** Saved site passwords and cookies are encrypted with ChaCha20-Poly1305
+  looked up by SHA-256 hash and also stored encrypted, so the admin can view them.
+- **Secrets at rest.** User keys, saved site passwords, and cookies are encrypted with ChaCha20-Poly1305
   under a key derived from `WEB_MCP_AUTH_TOKEN`, and each one is bound to its user and site.
   A copy of the database alone reveals nothing. **Rotating `WEB_MCP_AUTH_TOKEN`** signs
   everyone out and makes saved site passwords and cookies unreadable, so they must be entered
-  again. User keys keep working.
+  again. User keys keep working but can't be displayed until you issue a **New key**.
 - **Admin UI.** Sessions use a signed `HttpOnly; SameSite=Strict` cookie (`Secure` over HTTPS).
   Every change must come from the same origin (CSRF protection), and all output is HTML-escaped.
 - **Passwords in chat.** Passing a username and password to `site_login` sends them through
