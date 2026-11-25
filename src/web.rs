@@ -480,17 +480,22 @@ impl WebClient {
         form: Option<&FormPost>,
         mut session: Option<&mut SiteSession>,
     ) -> Result<Response, WebError> {
+        let impersonating = self.config.impersonate != "none";
         match self
             .request_as(url, form, session.as_deref_mut(), Profile::Browser)
             .await
         {
-            Err(WebError::Blocked { block, .. })
-                if block.is_generic_denial() && self.config.impersonate != "none" =>
-            {
+            Err(WebError::Blocked { block, .. }) if block.is_generic_denial() && impersonating => {
                 // Some sites (e.g. Wikimedia's file servers) reject impersonated browsers but
                 // serve plain clients; vendor challenges are never retried.
                 info!(%url, "generic 403 while impersonating a browser; retrying as a plain client");
                 self.request_as(url, form, session, Profile::Plain).await
+            }
+            Err(WebError::Fetch(error)) if impersonating && is_stream_reset(&error) => {
+                // Some anti-bot setups (e.g. Akamai on bestbuy.com product pages) reset the
+                // HTTP/2 stream for every desktop browser fingerprint but serve mobile Safari.
+                info!(%url, "stream reset while impersonating a desktop browser; retrying as mobile Safari");
+                self.request_as(url, form, session, Profile::Mobile).await
             }
             other => other,
         }
@@ -575,6 +580,24 @@ enum Profile {
     Browser,
     /// No impersonation or stealth headers: a plain HTTP client.
     Plain,
+    /// Safari on iPhone, for sites that turn away every desktop fingerprint.
+    Mobile,
+}
+
+/// The impersonation profile name [`Profile::Mobile`] asks scrapling for.
+const MOBILE_IMPERSONATION: &str = "safari_ios";
+
+/// Whether `error` is the server resetting the HTTP/2 stream (`RST_STREAM`), which is how some
+/// anti-bot systems refuse a request instead of answering with a status code.
+fn is_stream_reset(error: &FetchError) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if error.to_string().contains("stream error received") {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }
 
 /// Per-request fetcher settings: no automatic redirects, plus cookies, form body, and profile.
@@ -583,12 +606,19 @@ fn request_config(
     form: Option<&FormPost>,
     profile: Profile,
 ) -> RequestConfig {
-    let plain = profile == Profile::Plain;
+    let (impersonate, stealthy_headers) = match profile {
+        Profile::Browser => (None, None),
+        Profile::Plain => (Some(Impersonate::None), Some(false)),
+        Profile::Mobile => (
+            Some(Impersonate::Single(MOBILE_IMPERSONATION.to_owned())),
+            None,
+        ),
+    };
     let mut config = RequestConfig {
         follow_redirects: Some(FollowRedirects::None),
         cookies,
-        impersonate: plain.then_some(Impersonate::None),
-        stealthy_headers: plain.then_some(false),
+        impersonate,
+        stealthy_headers,
         ..Default::default()
     };
     if let Some(form) = form {
@@ -751,6 +781,29 @@ fn window(text: &str, start: usize, max: usize) -> (String, usize, Option<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_resets_are_recognized_through_retries() {
+        let reset = FetchError::MaxRetriesExceeded {
+            attempts: 2,
+            last_error: Box::new(FetchError::Other(
+                "stream error received: unexpected internal error encountered".into(),
+            )),
+        };
+        assert!(is_stream_reset(&reset));
+        assert!(!is_stream_reset(&FetchError::Other(
+            "connection refused".into()
+        )));
+    }
+
+    #[test]
+    fn mobile_profile_impersonates_ios_safari() {
+        let config = request_config(None, None, Profile::Mobile);
+        assert!(
+            matches!(config.impersonate, Some(Impersonate::Single(ref name)) if name == MOBILE_IMPERSONATION)
+        );
+        assert_eq!(config.stealthy_headers, None);
+    }
 
     #[test]
     fn rejects_non_http_schemes() {

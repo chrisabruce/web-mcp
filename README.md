@@ -15,7 +15,8 @@ It's packaged as a Docker container for Dokploy.
 | `fetch_image` | Downloads an image so Claude can see it. Large images are downscaled to 1568 px, formats Claude can't read (BMP, ICO) are converted, and SVGs come back as markup. |
 | `site_login` | Logs in through a site's username/password form. It uses the login you saved in the admin UI, or a username and password given in the chat. The session is kept for later fetches. |
 | `list_site_logins` | Lists the sites you have saved logins or sessions for. Passwords are never shown. |
-| `send_email` | Sends an email from your account (see [Email](#email)). Attachments can be text Claude writes, base64 bytes, or a file downloaded from a URL through the proxy (logged in if you have a session). Only listed when email is configured. |
+| `send_email` | Sends an email from your account (see [Email](#email)). Attachments can be text Claude writes, a file downloaded from a URL through the proxy (logged in if you have a session), or a file from Claude's own workspace (see [Attaching files from Claude's workspace](#attaching-files-from-claudes-workspace)). Only listed when email is configured. |
+| `create_upload` | Returns a single-use upload URL so Claude can `curl` a workspace file to the server and attach it by `upload_id`. Only listed when email is configured. |
 
 All web traffic uses `SOCKS_PROXY` (email goes straight to Fastmail). `use_login` on `fetch_url` and `fetch_image` controls sessions:
 leave it out to use a saved session if one exists, set `true` to require one (logging in with
@@ -85,6 +86,31 @@ Who can send:
 - **Other users** can't until you click **Allow** in the **Email** column under **User keys**.
   They then send as `MAIL_FROM` too, so only allow people you trust with your address.
 
+### Attaching files from Claude's workspace
+
+Claude's workspace (where it writes files like `/mnt/user-data/outputs/report.pdf`) is a
+different machine from this server, so the server can't read those paths. `send_email`
+supports three ways to move the bytes, and its tool description tells Claude to try them in
+this order:
+
+1. **File reference (`content`).** Claude puts `sha256:<hash>:<path>` in the attachment's
+   `content` field, the same convention the Gmail connector uses. If the Claude app replaces
+   the reference with the file's bytes before calling the tool, nothing else is needed. If it
+   doesn't, the server refuses the unreplaced reference with a clear error and Claude moves
+   on, so a broken attachment is never sent.
+2. **Upload (`create_upload` + `upload_id`).** Claude calls `create_upload`, runs the
+   `curl -T <file> <url>` command it returns, and attaches the file by `upload_id`. The URL is
+   a random single-use link that expires after an hour, accepts one file up to
+   `MAIL_MAX_ATTACHMENT_MB`, and is the only credential involved (no key goes into the
+   shell). Uploads are held in memory, only the uploader can attach them, and they are
+   dropped once sent. Claude's sandbox only reaches allowed domains, so you may need to add
+   your server's domain (e.g. `mcp.example.com`) to the allowed domains under claude.ai
+   **Settings → Capabilities**.
+3. **`base64`.** Claude types the bytes into the call. Only practical for small files.
+
+`text` (contents Claude writes) and `url` (files on the web) work as before and need none of
+this.
+
 Limits: by default 2 recipients (to + cc + bcc) and 25 MB of attachments per message; change
 them with `MAIL_MAX_RECIPIENTS` and `MAIL_MAX_ATTACHMENT_MB`. Each sent email is logged with the
 user, recipients, attachment count, and Message-ID. Claude Desktop asks before running `send_email`
@@ -133,6 +159,10 @@ To test the image locally, copy `.env.example` to `.env`, set a token, and run
 - **Email.** The API token is never logged. Messages go directly to Fastmail's JMAP API over
   HTTPS, not through the proxy. Sending is limited to the
   admin and users the admin has allowed.
+- **Uploads.** `PUT /uploads/{token}` needs no bearer token. The 256-bit random token in the URL
+  is the credential (only its hash is kept), and it works once, expires after an hour, and is
+  issued only to users allowed to send email. Files stay in memory, bound to their uploader.
+  The route only exists when email is configured.
 - **Passwords in chat.** Passing a username and password to `site_login` sends them through
   your Claude conversation. Saving them in the admin UI keeps them out of chats.
 - **OAuth.** It uses authorization code + PKCE (S256) with dynamic client registration.
@@ -191,4 +221,8 @@ web-mcp test-email you@example.com  # check the email settings
 - If a site returns a plain `403` (no anti-bot vendor detected), the request is retried once
   without browser impersonation. Some sites, such as Wikimedia's file servers, reject
   impersonated browsers but serve plain clients.
+- If a site resets the HTTP/2 stream (a refusal some anti-bot systems use instead of a status
+  code), the request is retried once as Safari on iPhone. Best Buy product pages, for example,
+  reset every desktop browser fingerprint but serve iOS. This needs a scrapling-fetch build
+  that knows the `safari_ios` profile.
 - Run `make help` to list the build, test, and Docker targets.

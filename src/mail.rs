@@ -874,6 +874,7 @@ pub mod testing {
             .route("/jmap/session", get(session))
             .route("/upload/acc1/", post(upload))
             .route("/api", post(api))
+            .layer(axum::extract::DefaultBodyLimit::disable())
             .with_state(fake.clone());
         tokio::spawn(async move { axum::serve(listener, app).await });
         let mut config = MailConfig {

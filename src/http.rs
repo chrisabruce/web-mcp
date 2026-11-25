@@ -32,6 +32,7 @@ use crate::{
     oauth::OAuth,
     sites::Sites,
     store::Store,
+    uploads::Uploads,
     web::WebClient,
 };
 
@@ -46,6 +47,8 @@ pub struct Services {
     pub sites: Sites,
     /// Outgoing email, if configured.
     pub mailer: Option<Mailer>,
+    /// Files uploaded for email attachments.
+    pub uploads: Uploads,
 }
 
 impl Services {
@@ -59,6 +62,7 @@ impl Services {
     ) -> Self {
         Self {
             mailer,
+            uploads: Uploads::new(&config.public_base_url()),
             auth: Authenticator::new(master, store.clone()),
             sites: Sites::new(web, store),
             config: Arc::new(config),
@@ -86,8 +90,15 @@ pub async fn serve(services: Services, shutdown: CancellationToken) -> std::io::
 fn router(services: &Services, cancel: CancellationToken) -> Router {
     let config = &services.config;
     let (sites, mailer) = (services.sites.clone(), services.mailer.clone());
+    let uploads = services.uploads.clone();
     let mcp = StreamableHttpService::new(
-        move || Ok(WebMcp::new(sites.clone(), mailer.clone())),
+        move || {
+            Ok(WebMcp::new(
+                sites.clone(),
+                mailer.clone(),
+                Some(uploads.clone()),
+            ))
+        },
         Arc::new(LocalSessionManager::default()),
         mcp_transport_config(config, cancel),
     );
@@ -117,6 +128,10 @@ fn router(services: &Services, cancel: CancellationToken) -> Router {
     // Merged after the auth layer: OAuth, the UI (own cookie auth), and health need no bearer.
     if let Some(oauth) = oauth {
         router = router.merge(oauth.routes());
+    }
+    // The upload URL itself is the credential (see `uploads`).
+    if services.mailer.is_some() {
+        router = router.merge(services.uploads.clone().routes());
     }
     router
         .merge(admin::routes(admin))
@@ -753,6 +768,127 @@ mod tests {
                 &alice_ui,
             );
             assert_eq!(send(&app, attempt).await.0, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn workspace_files_attach_by_upload_or_file_content() {
+            let mut services = services(&["--public-url", PUBLIC]);
+            let (mailer, outbox) = crate::mail::testing::fake_jmap(|_| {}).await;
+            services.mailer = Some(mailer);
+            let app = router(&services, CancellationToken::new());
+            let tools = mcp_request(&app, TOKEN, "tools/list", serde_json::json!({})).await;
+            assert!(tools.contains("create_upload"), "{tools}");
+            assert!(tools.contains(r#""format":"byte""#), "{tools}");
+
+            let attach = |attachment: serde_json::Value| {
+                serde_json::json!({
+                    "name": "send_email",
+                    "arguments": {
+                        "to": "ann@example.org",
+                        "subject": "Cars",
+                        "body": "Attached.",
+                        "attachments": [attachment]
+                    }
+                })
+            };
+
+            // A file reference the app did not replace is refused, nothing is sent.
+            let reference = format!("sha256:{}:/mnt/user-data/outputs/cars.pdf", "a".repeat(64));
+            let refused = mcp_request(
+                &app,
+                TOKEN,
+                "tools/call",
+                attach(serde_json::json!({"filename": "cars.pdf", "content": reference})),
+            )
+            .await;
+            assert!(refused.contains("did not replace it"), "{refused}");
+            assert!(outbox.sent().is_empty());
+
+            // A replaced reference is plain base64, Gmail-style field names included.
+            let sent = mcp_request(
+                &app,
+                TOKEN,
+                "tools/call",
+                attach(serde_json::json!({
+                    "filename": "cars.pdf",
+                    "mimeType": "application/pdf",
+                    "content": "JVBERi0xLjQK"
+                })),
+            )
+            .await;
+            assert!(sent.contains("1 attachment(s)"), "{sent}");
+
+            // Upload: reserve a slot, PUT the bytes to the URL, attach by id.
+            let ticket = mcp_request(
+                &app,
+                TOKEN,
+                "tools/call",
+                serde_json::json!({
+                    "name": "create_upload",
+                    "arguments": {"path": "/mnt/user-data/outputs/car list.pdf"}
+                }),
+            )
+            .await;
+            assert!(
+                ticket.contains("-T '/mnt/user-data/outputs/car list.pdf'"),
+                "{ticket}"
+            );
+            let url = ticket
+                .split(&format!("'{PUBLIC}"))
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or_else(|| panic!("no upload URL in {ticket}"));
+            let path = url.trim_start_matches('/').to_owned();
+            let path = format!("/{path}");
+            let put = |body: &'static [u8]| {
+                Request::put(&path)
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            };
+            // Bigger than axum's default 2 MB body limit.
+            let pdf: &'static [u8] = Box::leak(vec![b'%'; 3 << 20].into_boxed_slice());
+            let (status, _, body) = send(&app, put(pdf)).await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            let received: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(received["bytes"], pdf.len());
+            assert_eq!(received["filename"], "car list.pdf");
+            let (status, _, _) = send(&app, put(b"again")).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+
+            let upload_id = received["upload_id"].as_str().unwrap();
+            let sent = mcp_request(
+                &app,
+                TOKEN,
+                "tools/call",
+                attach(serde_json::json!({"upload_id": upload_id})),
+            )
+            .await;
+            assert!(sent.contains("1 attachment(s)"), "{sent}");
+            let messages = outbox.sent();
+            assert_eq!(messages[1]["attachments"][0]["name"], "car list.pdf");
+            assert_eq!(
+                outbox.uploads.lock().unwrap().last().unwrap(),
+                &("application/pdf".to_owned(), pdf.len())
+            );
+
+            // Sent uploads are gone; unknown tokens are refused.
+            let again = mcp_request(
+                &app,
+                TOKEN,
+                "tools/call",
+                attach(serde_json::json!({"upload_id": upload_id})),
+            )
+            .await;
+            assert!(again.contains("unknown or expired upload_id"), "{again}");
+            let (status, _, _) = send(
+                &app,
+                Request::put("/uploads/bogus")
+                    .body(Body::from("x"))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
         }
 
         /// Runs the OAuth flow signing in with `key`; returns (access, refresh) tokens.

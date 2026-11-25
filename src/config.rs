@@ -239,9 +239,15 @@ impl Config {
     /// The MCP endpoint URL clients should use: under the public URL if set, else the bind
     /// address.
     pub fn public_mcp_url(&self) -> String {
+        format!("{}/mcp", self.public_base_url())
+    }
+
+    /// Base URL clients reach this server at (`WEB_MCP_PUBLIC_URL`, else the bind address),
+    /// without a trailing slash.
+    pub fn public_base_url(&self) -> String {
         match &self.public_url {
-            Some(url) => format!("{}/mcp", url.as_str().trim_end_matches('/')),
-            None => format!("http://{}/mcp", self.bind),
+            Some(url) => url.as_str().trim_end_matches('/').to_owned(),
+            None => format!("http://{}", self.bind),
         }
     }
 

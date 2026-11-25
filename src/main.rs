@@ -46,6 +46,7 @@ mod search;
 mod sites;
 mod store;
 mod token;
+mod uploads;
 mod web;
 
 use std::future::Future;
