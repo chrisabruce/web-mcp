@@ -56,7 +56,11 @@ const STORAGE_KEY_CONTEXT: &[u8] = b"web-mcp storage encryption key v1";
 const LAST_USED_RESOLUTION_SECS: u64 = 60;
 
 /// Schema migrations; entry `n` upgrades `user_version` `n` to `n + 1`.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, "ALTER TABLE users ADD COLUMN key_enc BLOB;"];
+const MIGRATIONS: &[&str] = &[
+    SCHEMA_V1,
+    "ALTER TABLE users ADD COLUMN key_enc BLOB;",
+    "ALTER TABLE users ADD COLUMN can_email INTEGER NOT NULL DEFAULT 0;",
+];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS users (
@@ -107,6 +111,8 @@ pub struct User {
     pub last_used_at: Option<u64>,
     /// Revocation time, if revoked.
     pub revoked_at: Option<u64>,
+    /// Whether the admin allowed this user to send email (the admin always may).
+    pub can_email: bool,
 }
 
 impl User {
@@ -324,6 +330,7 @@ impl Store {
                 created_at: created,
                 last_used_at: None,
                 revoked_at: None,
+                can_email: false,
             };
             Ok((user, key))
         })
@@ -337,7 +344,7 @@ impl Store {
                 "{USER_COLUMNS}, key_enc FROM users ORDER BY key_prefix IS NOT NULL, created_at"
             ))?;
             let rows = stmt.query_map([], |row| {
-                Ok((user_from_row(row)?, row.get::<_, Option<Vec<u8>>>(6)?))
+                Ok((user_from_row(row)?, row.get::<_, Option<Vec<u8>>>(7)?))
             })?;
             let mut listings = Vec::new();
             for row in rows {
@@ -391,6 +398,23 @@ impl Store {
                 params![now(), id.0],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Allows or forbids a user to send email. The admin always may.
+    pub async fn set_can_email(&self, id: UserId, allowed: bool) -> Result<(), StoreError> {
+        if id == self.admin {
+            return Ok(());
+        }
+        self.call(move |conn, _| {
+            match conn.execute(
+                "UPDATE users SET can_email = ?1 WHERE id = ?2",
+                params![allowed, id.0],
+            )? {
+                0 => Err(StoreError::UnknownUser),
+                _ => Ok(()),
+            }
         })
         .await
     }
@@ -597,7 +621,8 @@ impl Store {
     }
 }
 
-const USER_COLUMNS: &str = "SELECT id, name, key_prefix, created_at, last_used_at, revoked_at";
+const USER_COLUMNS: &str =
+    "SELECT id, name, key_prefix, created_at, last_used_at, revoked_at, can_email";
 
 fn user_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
     Ok(User {
@@ -607,6 +632,7 @@ fn user_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         created_at: row.get(3)?,
         last_used_at: row.get(4)?,
         revoked_at: row.get(5)?,
+        can_email: row.get(6)?,
     })
 }
 

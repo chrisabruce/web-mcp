@@ -2,7 +2,8 @@
 
 An MCP server that lets Claude **search the web and read pages through a SOCKS proxy**, built on
 [scrapling-rs](https://github.com/chrisabruce/scrapling-rs) (browser TLS/HTTP2 impersonation).
-It can view images, log in to sites for you, and serve several people, each with their own key.
+It can view images, log in to sites for you, send email with attachments from your account, and
+serve several people, each with their own key.
 It's packaged as a Docker container for Dokploy.
 
 ## Tools
@@ -14,8 +15,9 @@ It's packaged as a Docker container for Dokploy.
 | `fetch_image` | Downloads an image so Claude can see it. Large images are downscaled to 1568 px, formats Claude can't read (BMP, ICO) are converted, and SVGs come back as markup. |
 | `site_login` | Logs in through a site's username/password form. It uses the login you saved in the admin UI, or a username and password given in the chat. The session is kept for later fetches. |
 | `list_site_logins` | Lists the sites you have saved logins or sessions for. Passwords are never shown. |
+| `send_email` | Sends an email from your account (see [Email](#email)). Attachments can be text Claude writes, base64 bytes, or a file downloaded from a URL through the proxy (logged in if you have a session). Only listed when email is configured. |
 
-All tools use `SOCKS_PROXY`. `use_login` on `fetch_url` and `fetch_image` controls sessions:
+All web traffic uses `SOCKS_PROXY` (email goes straight to Fastmail). `use_login` on `fetch_url` and `fetch_image` controls sessions:
 leave it out to use a saved session if one exists, set `true` to require one (logging in with
 the saved password if needed), or `false` to fetch anonymously.
 
@@ -55,6 +57,38 @@ Open `https://mcp.example.com/admin` and sign in with `WEB_MCP_AUTH_TOKEN`.
 
 Sessions and logins are private to each key. Passwords and cookies are encrypted at rest and
 never shown again.
+
+## Email
+
+`send_email` sends from one account: yours. To enable it with Fastmail:
+
+1. In Fastmail, go to **Settings → Privacy & Security → Manage API tokens** and create a token
+   with **Email** and **Email submission** access. (Read-only won't do.)
+2. Set these in Dokploy's **Environment** tab and redeploy:
+   ```sh
+   FASTMAIL_API_TOKEN=fmu1-...
+   MAIL_FROM="Your Name <you@yourdomain.com>"   # optional; defaults to your primary address
+   MAIL_BCC=someone@example.com                  # optional; an extra copy of everything sent
+   ```
+   `MAIL_FROM` must be one of your Fastmail sending identities (Settings → Sending
+   identities). An address on a domain with a `*@domain` identity also works.
+3. Check the logs for `email enabled from=…`. Problems show up as `account check failed` with the
+   reason: a rejected token, a missing scope, or a `MAIL_FROM` you can't send as (with your
+   identities listed). From a shell you can also run `web-mcp test-email you@example.com`.
+
+Mail is sent through Fastmail's JMAP API, so every message Claude sends is saved in your
+**Sent** folder.
+
+Who can send:
+
+- **The admin** (master token) can always send.
+- **Other users** can't until you click **Allow** in the **Email** column under **User keys**.
+  They then send as `MAIL_FROM` too, so only allow people you trust with your address.
+
+Limits: by default 2 recipients (to + cc + bcc) and 25 MB of attachments per message; change
+them with `MAIL_MAX_RECIPIENTS` and `MAIL_MAX_ATTACHMENT_MB`. Each sent email is logged with the
+user, recipients, attachment count, and Message-ID. Claude Desktop asks before running `send_email`
+unless you've set it to always allow.
 
 ## Connect Claude
 
@@ -96,6 +130,9 @@ To test the image locally, copy `.env.example` to `.env`, set a token, and run
   again. User keys keep working but can't be displayed until you issue a **New key**.
 - **Admin UI.** Sessions use a signed `HttpOnly; SameSite=Strict` cookie (`Secure` over HTTPS).
   Every change must come from the same origin (CSRF protection), and all output is HTML-escaped.
+- **Email.** The API token is never logged. Messages go directly to Fastmail's JMAP API over
+  HTTPS, not through the proxy. Sending is limited to the
+  admin and users the admin has allowed.
 - **Passwords in chat.** Passing a username and password to `site_login` sends them through
   your Claude conversation. Saving them in the admin UI keeps them out of chats.
 - **OAuth.** It uses authorization code + PKCE (S256) with dynamic client registration.
@@ -130,6 +167,12 @@ Every setting can be given as a CLI flag, an environment variable, or a line in 
 | `WEB_MCP_MAX_CHARS` | `40000` | Default page content cap per call. |
 | `WEB_MCP_IMPERSONATE` | `chrome` | `chrome`, `firefox`, `safari`, `edge`, or `none`. |
 | `WEB_MCP_SEARCH_ENGINES` | `duckduckgo-lite,bing,duckduckgo-html` | Engines to try, in order. |
+| `FASTMAIL_API_TOKEN` | none (email off) | Fastmail API token with Email and Email submission access. |
+| `JMAP_SESSION_URL` | `https://api.fastmail.com/jmap/session` | JMAP server (for non-Fastmail JMAP providers). |
+| `MAIL_FROM` | primary identity | Sender, e.g. `Name <me@example.com>`; must be a sending identity. |
+| `MAIL_BCC` | none | Gets a blind copy of every message sent. |
+| `MAIL_MAX_RECIPIENTS` | `2` | Most recipients (to + cc + bcc) per email. `MAIL_BCC` isn't counted. |
+| `MAIL_MAX_ATTACHMENT_MB` | `25` | Most attachment megabytes per email. |
 
 ## CLI
 
@@ -138,6 +181,7 @@ web-mcp serve                       # Streamable HTTP server (the default)
 web-mcp stdio                       # stdio transport, acting as the admin
 web-mcp search rust async book      # check search (and the proxy) from the terminal
 web-mcp fetch https://example.com -f text
+web-mcp test-email you@example.com  # check the email settings
 ```
 
 ## Notes

@@ -132,6 +132,97 @@ pub struct Config {
     /// Directory for the SQLite database (user keys, saved site logins, sessions).
     #[arg(long, env = "WEB_MCP_DATA_DIR", default_value = "data", global = true)]
     pub data_dir: PathBuf,
+
+    /// Outgoing email (the `send_email` tool).
+    #[command(flatten)]
+    pub mail: MailConfig,
+}
+
+/// Settings for the `send_email` tool, which sends over JMAP. Email is enabled when
+/// `FASTMAIL_API_TOKEN` is set; the defaults suit Fastmail.
+///
+/// Mail goes directly to the JMAP server, not through the web proxy: it is the operator's own
+/// account, and signing in from proxy exits can trip the provider's fraud checks.
+#[derive(Debug, Clone, clap::Args)]
+pub struct MailConfig {
+    /// Fastmail API token (Settings → Privacy & Security → Manage API tokens) with **Email**
+    /// and **Email submission** access. Any JMAP server's bearer token also works.
+    #[arg(
+        long,
+        env = "FASTMAIL_API_TOKEN",
+        hide_env_values = true,
+        value_parser = SecretParser::<Password>::new(),
+        global = true
+    )]
+    pub api_token: Option<Password>,
+
+    /// JMAP session URL.
+    #[arg(
+        long,
+        env = "JMAP_SESSION_URL",
+        default_value = "https://api.fastmail.com/jmap/session",
+        global = true
+    )]
+    pub jmap_session_url: String,
+
+    /// Sender, e.g. `Chris <me@example.com>`. Defaults to the account's primary identity.
+    /// Must match one of the account's sending identities (or a `*@domain` identity).
+    #[arg(long, env = "MAIL_FROM", global = true)]
+    pub mail_from: Option<String>,
+
+    /// Address that receives a blind copy of every message sent, for your records.
+    #[arg(long, env = "MAIL_BCC", global = true)]
+    pub mail_bcc: Option<String>,
+
+    /// Most recipients (to + cc + bcc together) one email may have. `MAIL_BCC` is not counted.
+    #[arg(
+        long,
+        env = "MAIL_MAX_RECIPIENTS",
+        default_value_t = 2,
+        value_parser = clap::value_parser!(u32).range(1..),
+        global = true
+    )]
+    pub mail_max_recipients: u32,
+
+    /// Largest total size of one email's attachments, in megabytes. Base64 encoding adds about
+    /// a third on the wire; Fastmail accepts messages up to about 70 MB.
+    #[arg(
+        long,
+        env = "MAIL_MAX_ATTACHMENT_MB",
+        default_value_t = 25,
+        value_parser = clap::value_parser!(u32).range(1..),
+        global = true
+    )]
+    pub mail_max_attachment_mb: u32,
+}
+
+/// A password that never appears in logs or `Debug` output.
+#[derive(Clone)]
+pub struct Password(String);
+
+impl Password {
+    /// The raw password. Never log the result.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for Password {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("must not be empty");
+        }
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl fmt::Debug for Password {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Password(***)")
+    }
 }
 
 impl Config {
@@ -364,6 +455,27 @@ impl fmt::Debug for ProxyUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ProxyUrl({self})")
     }
+}
+
+/// Makes settings whose environment variable is set but empty count as unset.
+///
+/// clap treats `FOO=` as the value `""`, which fails to parse for typed settings (a proxy URL, a
+/// password). Compose files commonly pass optional settings as `${FOO:-}`, which produces exactly
+/// that, so this unbinds those arguments from their (empty) variables before parsing.
+pub fn ignore_empty_env(mut command: clap::Command) -> clap::Command {
+    let empty: Vec<clap::Id> = command
+        .get_arguments()
+        .filter(|arg| {
+            arg.get_env()
+                .and_then(std::env::var_os)
+                .is_some_and(|value| value.is_empty())
+        })
+        .map(|arg| arg.get_id().clone())
+        .collect();
+    for id in empty {
+        command = command.mut_arg(id, |arg| arg.env(None::<&'static str>));
+    }
+    command
 }
 
 /// Loads `.env` files into the process environment, in the order described in the module docs.

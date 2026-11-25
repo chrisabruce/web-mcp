@@ -51,6 +51,8 @@ pub struct AdminState {
     pub secure_cookies: bool,
     /// The MCP endpoint URL, shown with newly created keys.
     pub mcp_url: String,
+    /// The `From` address of outgoing email, if email is configured.
+    pub mail_from: Option<String>,
 }
 
 type AppState = State<Arc<AdminState>>;
@@ -64,6 +66,7 @@ pub fn routes(state: Arc<AdminState>) -> Router {
         .route("/admin/users", post(create_user))
         .route("/admin/users/{id}/revoke", post(revoke_user))
         .route("/admin/users/{id}/regenerate", post(regenerate_key))
+        .route("/admin/users/{id}/email", post(set_email_permission))
         .route("/admin/sites", post(save_site))
         .route("/admin/sites/cookies", post(import_cookies))
         .route("/admin/sites/login", post(site_login))
@@ -157,6 +160,10 @@ struct DashboardTemplate {
     message: Option<String>,
     error: Option<String>,
     created_key: Option<(String, String)>,
+    /// `From` address of outgoing email, if configured.
+    mail_from: Option<String>,
+    /// Whether the signed-in user may send email.
+    can_email: bool,
     sites: Vec<SiteRow>,
     users: Vec<UserRow>,
 }
@@ -184,6 +191,8 @@ struct UserRow {
     last_used: String,
     status: &'static str,
     revocable: bool,
+    /// Whether the user may send email.
+    can_email: bool,
 }
 
 /// Optional extras for rendering the dashboard.
@@ -225,6 +234,8 @@ async fn render_dashboard(state: &AdminState, user: &Principal, flash: Flash) ->
         message: flash.message,
         error: flash.error,
         created_key: flash.created_key,
+        mail_from: state.mail_from.clone(),
+        can_email: user.can_email,
         sites: sites
             .into_iter()
             .map(|s| SiteRow {
@@ -268,6 +279,7 @@ fn user_row(UserListing { user: u, key }: UserListing) -> UserRow {
     let active = !u.is_admin() && u.revoked_at.is_none();
     UserRow {
         revocable: active,
+        can_email: u.is_admin() || u.can_email,
         status: match (u.is_admin(), u.revoked_at) {
             (true, _) => "master token",
             (false, Some(_)) => "revoked",
@@ -320,6 +332,8 @@ struct DashboardQuery {
 fn message_text(code: &str) -> Option<&'static str> {
     Some(match code {
         "user-revoked" => "Key revoked. Its Claude sessions stop working immediately.",
+        "email-allowed" => "Email sending allowed for that user.",
+        "email-forbidden" => "Email sending turned off for that user.",
         "site-saved" => "Login saved.",
         "cookies-imported" => "Cookies imported. Claude will use this session for the site.",
         "session-ended" => "Session ended.",
@@ -460,6 +474,39 @@ async fn regenerate_key(
         Err(err @ (StoreError::UnknownUser | StoreError::CannotRevokeAdmin)) => {
             show_error(&state, &user, err.to_string()).await
         }
+        Err(err) => store_failure(&err),
+    }
+}
+
+#[derive(Deserialize)]
+struct EmailPermissionForm {
+    allow: bool,
+}
+
+async fn set_email_permission(
+    State(state): AppState,
+    UiUser(user): UiUser,
+    Path(id): Path<i64>,
+    Form(form): Form<EmailPermissionForm>,
+) -> Response {
+    if !user.is_admin {
+        return (StatusCode::FORBIDDEN, "admin only").into_response();
+    }
+    match state
+        .auth
+        .store()
+        .set_can_email(UserId(id), form.allow)
+        .await
+    {
+        Ok(()) => {
+            info!(admin = %user.name, user_id = id, allowed = form.allow, "changed email permission");
+            done(if form.allow {
+                "email-allowed"
+            } else {
+                "email-forbidden"
+            })
+        }
+        Err(err @ StoreError::UnknownUser) => show_error(&state, &user, err.to_string()).await,
         Err(err) => store_failure(&err),
     }
 }

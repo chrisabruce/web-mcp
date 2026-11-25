@@ -39,6 +39,7 @@ mod config;
 mod cookies;
 mod http;
 mod images;
+mod mail;
 mod mcp;
 mod oauth;
 mod search;
@@ -50,13 +51,14 @@ mod web;
 use std::future::Future;
 
 use anyhow::Context as _;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
     config::Config,
     http::Services,
+    mail::{Email, Mailer},
     store::Store,
     web::{Format, PageRequest, WebClient},
 };
@@ -86,6 +88,11 @@ enum Command {
         #[arg(short = 'n', long, default_value_t = 10)]
         limit: usize,
     },
+    /// Send a test email to check the email settings.
+    TestEmail {
+        /// Recipient address.
+        to: String,
+    },
     /// Fetch a page and print its content (useful for testing the proxy).
     Fetch {
         /// URL to fetch.
@@ -101,7 +108,8 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     let env_files = config::load_env_files();
-    let cli = Cli::parse();
+    let matches = config::ignore_empty_env(Cli::command()).get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     init_tracing();
     for file in &env_files {
         tracing::info!(file = %file.display(), "loaded environment file");
@@ -115,8 +123,27 @@ fn main() -> anyhow::Result<()> {
         Command::Stdio => {
             let services = services(config, web)?;
             let admin = services.auth.admin();
-            block_on(mcp::serve_stdio(services.sites, admin))
+            block_on(mcp::serve_stdio(services.sites, services.mailer, admin))
         }
+        Command::TestEmail { to } => block_on(async move {
+            let mailer = Mailer::from_config(&config.mail)?
+                .context("email is not configured; set FASTMAIL_API_TOKEN")?;
+            let sent = mailer
+                .send(Email {
+                    to: vec![to],
+                    subject: "web-mcp test email".into(),
+                    text: "Email from web-mcp is working.".into(),
+                    ..Email::default()
+                })
+                .await?;
+            println!(
+                "Sent from {} to {} ({})",
+                sent.from,
+                sent.recipients.join(", "),
+                sent.message_id
+            );
+            Ok(())
+        }),
         Command::Search { query, limit } => block_on(async move {
             let hits = web.search(&query.join(" "), limit).await?;
             println!("{}", serde_json::to_string_pretty(&hits)?);
@@ -145,12 +172,20 @@ fn services(config: Config, web: WebClient) -> anyhow::Result<Services> {
     let master = config.master_token()?;
     let store = Store::open(&config.data_dir, &master)
         .with_context(|| format!("opening database in {}", config.data_dir.display()))?;
-    Ok(Services::new(config, master, web, store))
+    let mailer = Mailer::from_config(&config.mail).context("configuring email")?;
+    Ok(Services::new(config, master, web, store, mailer))
 }
 
 /// HTTP mode (the container entry point): serve until SIGINT/SIGTERM, then drain.
 async fn serve(services: Services) -> anyhow::Result<()> {
     let bind = services.config.bind;
+    match &services.mailer {
+        Some(mailer) => {
+            let mailer = mailer.clone();
+            tokio::spawn(async move { mailer.check().await });
+        }
+        None => tracing::info!("email disabled (FASTMAIL_API_TOKEN not set)"),
+    }
     let shutdown = CancellationToken::new();
     tokio::spawn({
         let shutdown = shutdown.clone();

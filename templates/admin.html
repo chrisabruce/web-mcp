@@ -73,12 +73,25 @@
     </fieldset>
   </section>
 
+  <section>
+    <h2>Email</h2>
+    {% if let Some(from) = mail_from %}
+      {% if can_email %}
+      <p>Claude can send email (with attachments) as <code>{{ from }}</code> using the <code>send_email</code> tool.</p>
+      {% else %}
+      <p class="muted">Email sending is not enabled for your key. Ask the admin to allow it.</p>
+      {% endif %}
+    {% else %}
+      <p class="muted">Email is not configured. Set <code>FASTMAIL_API_TOKEN</code> (with Email and Email submission access) and optionally <code>MAIL_FROM</code> on the server.</p>
+    {% endif %}
+  </section>
+
   {% if is_admin %}
   <section>
     <h2>User keys</h2>
     <p class="muted">Each key is a separate user with its own site logins. Keys work as Claude Code bearer tokens and as the sign-in password for Claude Desktop / claude.ai. Click <em>Show</em> to view a key. <em>New key</em> replaces a key (the old one stops working); <em>Revoke</em> disables the user and ends all their sessions immediately.</p>
     <table>
-      <thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th>Status</th><th>Email</th><th></th></tr></thead>
       <tbody>
       {% for u in users %}
         <tr>
@@ -93,6 +106,12 @@
           <td class="muted">{{ u.created }}</td>
           <td class="muted">{{ u.last_used }}</td>
           <td>{{ u.status }}</td>
+          <td>{% if u.revocable %}
+            <form class="inline" method="post" action="/admin/users/{{ u.id }}/email">
+              {% if u.can_email %}<input type="hidden" name="allow" value="false">allowed <button class="secondary" type="submit">Turn off</button>
+              {% else %}<input type="hidden" name="allow" value="true"><span class="muted">off</span> <button class="secondary" type="submit">Allow</button>{% endif %}
+            </form>
+          {% else if u.can_email %}allowed{% endif %}</td>
           <td>{% if u.revocable %}
             <form class="inline" method="post" action="/admin/users/{{ u.id }}/regenerate"><button class="secondary" type="submit">New key</button></form>
             <form class="inline" method="post" action="/admin/users/{{ u.id }}/revoke"><button class="danger" type="submit">Revoke</button></form>

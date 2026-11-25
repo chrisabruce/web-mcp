@@ -27,6 +27,7 @@ use crate::{
     admin::{self, AdminState},
     auth::{Authenticator, McpAuth, require_auth},
     config::{Config, Secret},
+    mail::Mailer,
     mcp::WebMcp,
     oauth::OAuth,
     sites::Sites,
@@ -43,12 +44,21 @@ pub struct Services {
     pub auth: Authenticator,
     /// Logged-in and anonymous browsing.
     pub sites: Sites,
+    /// Outgoing email, if configured.
+    pub mailer: Option<Mailer>,
 }
 
 impl Services {
     /// Wires the services together. `master` is the validated `WEB_MCP_AUTH_TOKEN`.
-    pub fn new(config: Config, master: Secret, web: WebClient, store: Store) -> Self {
+    pub fn new(
+        config: Config,
+        master: Secret,
+        web: WebClient,
+        store: Store,
+        mailer: Option<Mailer>,
+    ) -> Self {
         Self {
+            mailer,
             auth: Authenticator::new(master, store.clone()),
             sites: Sites::new(web, store),
             config: Arc::new(config),
@@ -75,9 +85,9 @@ pub async fn serve(services: Services, shutdown: CancellationToken) -> std::io::
 /// Builds the application router. Cancelling `cancel` closes all MCP sessions.
 fn router(services: &Services, cancel: CancellationToken) -> Router {
     let config = &services.config;
-    let sites = services.sites.clone();
+    let (sites, mailer) = (services.sites.clone(), services.mailer.clone());
     let mcp = StreamableHttpService::new(
-        move || Ok(WebMcp::new(sites.clone())),
+        move || Ok(WebMcp::new(sites.clone(), mailer.clone())),
         Arc::new(LocalSessionManager::default()),
         mcp_transport_config(config, cancel),
     );
@@ -98,6 +108,7 @@ fn router(services: &Services, cancel: CancellationToken) -> Router {
             .as_ref()
             .is_some_and(|u| u.scheme() == "https"),
         mcp_url: config.public_mcp_url(),
+        mail_from: services.mailer.as_ref().map(Mailer::sender),
     });
 
     let mut router = Router::new()
@@ -143,7 +154,7 @@ mod tests {
         let config = TestCli::parse_from(argv).config;
         let master: Secret = TOKEN.parse().unwrap();
         let web = WebClient::new(&config).unwrap();
-        Services::new(config, master.clone(), web, Store::in_memory(&master))
+        Services::new(config, master.clone(), web, Store::in_memory(&master), None)
     }
 
     /// Starts the router on an ephemeral port and returns its address.
@@ -628,6 +639,120 @@ mod tests {
             );
             // The admin is unaffected.
             assert_eq!(send(&app, mcp_ping(TOKEN)).await.0, StatusCode::OK);
+        }
+
+        // ---- send_email --------------------------------------------------------------------
+
+        /// Opens an MCP session as `bearer`, sends one request, and returns the response body.
+        async fn mcp_request(
+            app: &Router,
+            bearer: &str,
+            method: &str,
+            params: serde_json::Value,
+        ) -> String {
+            let (status, headers, _) = send(app, mcp_ping(bearer)).await;
+            assert_eq!(status, StatusCode::OK);
+            let session = headers["mcp-session-id"].to_str().unwrap().to_owned();
+            let post = |body: serde_json::Value| {
+                Request::post("/mcp")
+                    .header("host", "mcp.example.com")
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("mcp-session-id", &session)
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .body(Body::from(body.to_string()))
+                    .unwrap()
+            };
+            let initialized =
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+            send(app, post(initialized)).await;
+            let request =
+                serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": method, "params": params});
+            send(app, post(request)).await.2
+        }
+
+        fn email_call(to: &str) -> serde_json::Value {
+            serde_json::json!({
+                "name": "send_email",
+                "arguments": {
+                    "to": to,
+                    "subject": "Report",
+                    "body": "Attached.",
+                    "attachments": [{"filename": "data.csv", "text": "a,b\n1,2\n"}]
+                }
+            })
+        }
+
+        #[tokio::test]
+        async fn send_email_needs_configuration_and_permission() {
+            let unconfigured = router(
+                &services(&["--public-url", PUBLIC]),
+                CancellationToken::new(),
+            );
+            let tools =
+                mcp_request(&unconfigured, TOKEN, "tools/list", serde_json::json!({})).await;
+            assert!(tools.contains("fetch_url") && !tools.contains("send_email"));
+
+            let mut services = services(&["--public-url", PUBLIC]);
+            let (mailer, outbox) = crate::mail::testing::fake_jmap(|_| {}).await;
+            services.mailer = Some(mailer);
+            let app = router(&services, CancellationToken::new());
+            let tools = mcp_request(&app, TOKEN, "tools/list", serde_json::json!({})).await;
+            assert!(tools.contains("send_email"));
+
+            // The admin may always send; the attachment arrives.
+            let reply = mcp_request(&app, TOKEN, "tools/call", email_call("ann@example.org")).await;
+            assert!(
+                reply.contains("Sent from Me <me@fastmail.com> to ann@example.org"),
+                "{reply}"
+            );
+            let messages = outbox.sent();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["attachments"][0]["name"], "data.csv");
+
+            // Other users need the admin's permission.
+            let store = services.auth.store();
+            let (alice, alice_key) = store.create_user("alice").await.unwrap();
+            let refused = mcp_request(
+                &app,
+                &alice_key,
+                "tools/call",
+                email_call("bob@example.org"),
+            )
+            .await;
+            assert!(refused.contains("not allowed to send email"), "{refused}");
+            assert_eq!(outbox.sent().len(), 1);
+
+            let admin = ui_sign_in(&app, TOKEN).await;
+            let (_, _, page) = send(&app, ui_get("/admin", &admin)).await;
+            assert!(
+                page.contains("as <code>your account&#39;s primary address</code>"),
+                "{page}"
+            );
+            let allow = ui_post(
+                &format!("/admin/users/{}/email", alice.id),
+                "allow=true".into(),
+                &admin,
+            );
+            assert_eq!(send(&app, allow).await.0, StatusCode::SEE_OTHER);
+            let reply = mcp_request(
+                &app,
+                &alice_key,
+                "tools/call",
+                email_call("bob@example.org"),
+            )
+            .await;
+            assert!(reply.contains("to bob@example.org"), "{reply}");
+            assert_eq!(outbox.sent().len(), 2);
+
+            // Only the admin can grant it.
+            let alice_ui = ui_sign_in(&app, &alice_key).await;
+            let attempt = ui_post(
+                &format!("/admin/users/{}/email", alice.id),
+                "allow=false".into(),
+                &alice_ui,
+            );
+            assert_eq!(send(&app, attempt).await.0, StatusCode::FORBIDDEN);
         }
 
         /// Runs the OAuth flow signing in with `key`; returns (access, refresh) tokens.

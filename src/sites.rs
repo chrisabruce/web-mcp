@@ -21,7 +21,7 @@ use crate::{
     auth::Principal,
     cookies::{CookieJar, normalize_domain},
     store::{CookieSource, Credentials, SiteSummary, Store, StoreError},
-    web::{FetchedImage, FormPost, Page, PageRequest, SiteSession, WebClient, WebError},
+    web::{Download, FetchedImage, FormPost, Page, PageRequest, SiteSession, WebClient, WebError},
 };
 
 /// Whether a request should use the caller's saved session.
@@ -178,6 +178,21 @@ impl Sites {
     ) -> Result<FetchedImage, SiteError> {
         let mut session = self.session_for(user, url, mode).await?;
         let result = self.web.fetch_image(url, session.as_mut()).await;
+        self.persist(user, session.as_ref()).await;
+        Ok(result?)
+    }
+
+    /// Downloads a file of at most `max_bytes`, using `user`'s session for the site
+    /// according to `mode`.
+    pub async fn download(
+        &self,
+        user: &Principal,
+        url: &str,
+        mode: LoginMode,
+        max_bytes: usize,
+    ) -> Result<Download, SiteError> {
+        let mut session = self.session_for(user, url, mode).await?;
+        let result = self.web.download(url, session.as_mut(), max_bytes).await;
         self.persist(user, session.as_ref()).await;
         Ok(result?)
     }

@@ -23,6 +23,14 @@ services:
       WEB_MCP_MAX_CHARS: ${WEB_MCP_MAX_CHARS:-40000}
       WEB_MCP_IMPERSONATE: ${WEB_MCP_IMPERSONATE:-chrome}
       WEB_MCP_SEARCH_ENGINES: ${WEB_MCP_SEARCH_ENGINES:-duckduckgo-lite,bing,duckduckgo-html}
+      # Optional: email (send_email tool). A Fastmail API token with Email and Email
+      # submission access enables it.
+      FASTMAIL_API_TOKEN: ${FASTMAIL_API_TOKEN:-}
+      JMAP_SESSION_URL: ${JMAP_SESSION_URL:-https://api.fastmail.com/jmap/session}
+      MAIL_FROM: ${MAIL_FROM:-}
+      MAIL_BCC: ${MAIL_BCC:-}
+      MAIL_MAX_RECIPIENTS: ${MAIL_MAX_RECIPIENTS:-2}
+      MAIL_MAX_ATTACHMENT_MB: ${MAIL_MAX_ATTACHMENT_MB:-25}
       RUST_LOG: ${RUST_LOG:-info}
     # User keys, saved site logins, and sessions (SQLite). Keep this volume when redeploying.
     volumes:

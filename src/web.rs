@@ -37,7 +37,7 @@ use crate::{
 const MAX_REDIRECTS: usize = 10;
 
 /// Largest image download accepted.
-const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
 
 /// A logged-in session for one site, threaded through requests so `Set-Cookie` updates
 /// (including those on intermediate redirects) are captured.
@@ -74,6 +74,17 @@ pub struct FormPost {
     pub fields: Vec<(String, String)>,
     /// Page the form was on, sent as `Referer` (and its origin as `Origin`).
     pub referer: Url,
+}
+
+/// A downloaded file.
+#[derive(Debug, Clone)]
+pub struct Download {
+    /// Final URL after redirects.
+    pub url: String,
+    /// The `Content-Type` header, if any.
+    pub content_type: Option<String>,
+    /// The file's bytes.
+    pub body: Vec<u8>,
 }
 
 /// An image fetched for the model.
@@ -221,17 +232,22 @@ pub enum WebError {
         /// What was wrong.
         source: ImageError,
     },
-    /// The image URL answered with an error status.
-    #[error("{url} returned HTTP {status} instead of an image")]
-    ImageStatus {
+    /// A download (image or attachment) answered with an error status.
+    #[error("{url} returned HTTP {status} instead of the file")]
+    HttpStatus {
         /// The final URL.
         url: String,
         /// The HTTP status.
         status: u16,
     },
-    /// The image is larger than the download limit.
-    #[error("{0} is larger than the 25 MB image limit")]
-    ImageTooLarge(String),
+    /// The download is larger than the size limit.
+    #[error("{url} is larger than the {max_mb} MB limit")]
+    TooLarge {
+        /// The final URL.
+        url: String,
+        /// The limit that applied, in megabytes (rounded up).
+        max_mb: usize,
+    },
     /// Every configured search engine failed or returned no results.
     #[error("no search results for `{query}` (tried: {tried})")]
     NoResults {
@@ -272,8 +288,8 @@ impl WebError {
             | Self::TooManyRedirects(_) => {
                 error!(operation, target, error = %self, "request failed")
             }
-            Self::Image { .. } | Self::ImageStatus { .. } | Self::ImageTooLarge(_) => {
-                warn!(operation, target, error = %self, "unusable image")
+            Self::Image { .. } | Self::HttpStatus { .. } | Self::TooLarge { .. } => {
+                warn!(operation, target, error = %self, "unusable download")
             }
             Self::InvalidUrl { .. }
             | Self::UnsupportedScheme(_)
@@ -381,42 +397,67 @@ impl WebClient {
         Ok(tokio::task::spawn_blocking(move || engine.parse(&html)).await?)
     }
 
+    /// Downloads a file (an image, or an email attachment) of at most `max_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// The [`request`](Self::request) errors, plus [`WebError::HttpStatus`] for a non-2xx
+    /// answer and [`WebError::TooLarge`] above the size limit.
+    pub async fn download(
+        &self,
+        url: &str,
+        session: Option<&mut SiteSession>,
+        max_bytes: usize,
+    ) -> Result<Download, WebError> {
+        let url = parse_http_url(url)?;
+        let response = self.request(&url, None, session).await?;
+        let final_url = response.url().to_owned();
+        if !(200..300).contains(&response.status) {
+            return Err(WebError::HttpStatus {
+                url: final_url,
+                status: response.status,
+            });
+        }
+        if response.body.len() > max_bytes {
+            return Err(WebError::TooLarge {
+                url: final_url,
+                max_mb: max_bytes.div_ceil(1024 * 1024),
+            });
+        }
+        Ok(Download {
+            content_type: header(&response.headers, "content-type").map(str::to_owned),
+            body: response.body.into(),
+            url: final_url,
+        })
+    }
+
     /// Downloads an image and prepares it for the model (see [`images::prepare`]).
     ///
     /// # Errors
     ///
-    /// The [`fetch_page`](Self::fetch_page) errors, plus [`WebError::Image`] when the URL does
-    /// not serve an image and [`WebError::ImageTooLarge`] above the size limit.
+    /// The [`download`](Self::download) errors, plus [`WebError::Image`] when the URL does
+    /// not serve an image.
     pub async fn fetch_image(
         &self,
         url: &str,
         session: Option<&mut SiteSession>,
     ) -> Result<FetchedImage, WebError> {
-        let url = parse_http_url(url)?;
-        let response = self.request(&url, None, session).await?;
-        let final_url = response.url().to_owned();
-        if !(200..300).contains(&response.status) {
-            return Err(WebError::ImageStatus {
-                url: final_url,
-                status: response.status,
-            });
-        }
-        if response.body.len() > MAX_IMAGE_BYTES {
-            return Err(WebError::ImageTooLarge(final_url));
-        }
-        let content_type = header(&response.headers, "content-type").map(str::to_owned);
-        let source_bytes = response.body.len();
-        let prepared = tokio::task::spawn_blocking(move || {
-            images::prepare(&response.body, content_type.as_deref())
-        })
-        .await?;
+        let Download {
+            url,
+            content_type,
+            body,
+        } = self.download(url, session, MAX_DOWNLOAD_BYTES).await?;
+        let source_bytes = body.len();
+        let prepared =
+            tokio::task::spawn_blocking(move || images::prepare(&body, content_type.as_deref()))
+                .await?;
         let image = prepared.map_err(|source| WebError::Image {
-            url: final_url.clone(),
+            url: url.clone(),
             source,
         })?;
-        info!(url = %final_url, bytes = source_bytes, "fetched image");
+        info!(%url, bytes = source_bytes, "fetched image");
         Ok(FetchedImage {
-            url: final_url,
+            url,
             source_bytes,
             image,
         })

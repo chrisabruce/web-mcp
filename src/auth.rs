@@ -38,12 +38,15 @@ pub struct Principal {
     pub name: String,
     /// Whether the caller may manage users.
     pub is_admin: bool,
+    /// Whether the caller may send email (always true for the admin).
+    pub can_email: bool,
 }
 
 impl From<User> for Principal {
     fn from(user: User) -> Self {
         Self {
             is_admin: user.is_admin(),
+            can_email: user.is_admin() || user.can_email,
             id: user.id,
             name: user.name,
         }
@@ -85,6 +88,7 @@ impl Authenticator {
             id: self.store.admin_id(),
             name: crate::store::ADMIN_NAME.to_owned(),
             is_admin: true,
+            can_email: true,
         }
     }
 
